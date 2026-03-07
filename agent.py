@@ -191,6 +191,29 @@ async def maybe_shadow_summarize(state: CallState):
 
 
 # ---------------------------------------------------------------------------
+# Post-call archival helper (runs as background task from sync on_close)
+# ---------------------------------------------------------------------------
+async def _run_archival(state: CallState, meta: dict, call_duration: int):
+    """Run archive_call in a background task since on_close must be sync."""
+    try:
+        await archive_call(
+            call_id=state.call_id,
+            user_id=state.user_id,
+            character_id=meta.get("characterId"),
+            custom_character_id=meta.get("customCharacterId"),
+            memory_space_id=state.memory_space_id,
+            transcript=state.transcript,
+            shadow_summary=state.shadow_summary,
+            character_name=state.character_name,
+            cumulative_xp=state.cumulative_xp,
+            final_mood=state.current_mood,
+            call_duration_seconds=call_duration,
+        )
+    except Exception:
+        logger.exception("Post-call archival failed for call %s", state.call_id)
+
+
+# ---------------------------------------------------------------------------
 # Server and session lifecycle
 # ---------------------------------------------------------------------------
 server = AgentServer()
@@ -336,9 +359,9 @@ async def entrypoint(ctx: agents.JobContext):
             state.turns_since_shadow += 1
             logger.info("[Turn %d] Agent: %s", state.turn_index, content[:100])
 
-    # --- Cleanup on session close ---
+    # --- Cleanup on session close (must be sync — SDK requirement) ---
     @session.on("close")
-    async def on_close(event):
+    def on_close(event):
         # Cleanup billing
         if state.billing_task and not state.billing_task.done():
             state.billing_task.cancel()
@@ -352,24 +375,9 @@ async def entrypoint(ctx: agents.JobContext):
             state.cumulative_xp,
         )
 
-        # Post-call archival
+        # Schedule post-call archival as a background task
         if state.call_id and state.transcript:
-            try:
-                await archive_call(
-                    call_id=state.call_id,
-                    user_id=state.user_id,
-                    character_id=meta.get("characterId"),
-                    custom_character_id=meta.get("customCharacterId"),
-                    memory_space_id=state.memory_space_id,
-                    transcript=state.transcript,
-                    shadow_summary=state.shadow_summary,
-                    character_name=state.character_name,
-                    cumulative_xp=state.cumulative_xp,
-                    final_mood=state.current_mood,
-                    call_duration_seconds=call_duration,
-                )
-            except Exception:
-                logger.exception("Post-call archival failed for call %s", state.call_id)
+            asyncio.create_task(_run_archival(state, meta, call_duration))
 
     # Start billing loop
     if state.call_id:

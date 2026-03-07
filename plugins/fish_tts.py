@@ -1,40 +1,47 @@
 """
-Fish Speech TTS plugin — wraps Fish Audio's OpenAI-compatible
-TTS endpoint via the livekit-plugins-openai TTS adapter.
-Streams audio chunk-by-chunk for low-latency voice output.
+Fish Speech TTS plugin — uses Fish Audio's native /v1/tts endpoint.
+
+The livekit-plugins-openai TTS wrapper cannot be used because Fish Audio
+does NOT have an OpenAI-compatible /v1/audio/speech endpoint. This plugin
+implements livekit.agents.tts.TTS directly with httpx.
 
 Supports dynamic voice profiles per character:
-  - voice_profile_id: Fish Speech voice model ID (for pre-built archetypes)
+  - voice_profile_id: Fish Speech reference_id (for pre-built voices)
   - voice_reference_url: Custom reference audio URL (for voice cloning)
 """
 
-from livekit.plugins.openai import TTS
+from __future__ import annotations
 
-from config import FISH_SPEECH_API_KEY, FISH_SPEECH_API_URL, FISH_SPEECH_MODEL, FISH_SPEECH_VOICE_ID
+import asyncio
+from dataclasses import dataclass, replace
 
-# Pre-built voice archetypes — map personality archetype to Fish Speech voice IDs.
-# Populate these with actual Fish Audio model IDs after uploading reference audio.
-# The agent selects an archetype based on the character's persona keywords.
+import httpx
+from livekit.agents import tts
+from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions
+
+from config import FISH_SPEECH_API_KEY, FISH_SPEECH_API_URL, FISH_SPEECH_VOICE_ID
+
+SAMPLE_RATE = 44100
+NUM_CHANNELS = 1
+
+# Pre-built voice archetypes — map personality archetype to Fish Speech reference IDs.
 VOICE_ARCHETYPES = {
-    "tsundere_female":  "",  # Fiery, sharp tone with occasional softness
-    "kuudere_female":   "",  # Cool, composed, low-energy delivery
-    "genki_female":     "",  # Energetic, bright, upbeat
-    "dandere_female":   "",  # Soft, shy, hesitant delivery
-    "onee_san_female":  "",  # Mature, warm, gentle
-    "yandere_female":   "",  # Sweet surface, intense undertone
-    "default_female":   "",  # Neutral anime female voice
-    "shonen_male":      "",  # Energetic, determined male voice
-    "cool_male":        "",  # Calm, deep, composed male voice
-    "gentle_male":      "",  # Soft-spoken, kind male voice
-    "default_male":     "",  # Neutral anime male voice
+    "tsundere_female":  "",
+    "kuudere_female":   "",
+    "genki_female":     "",
+    "dandere_female":   "",
+    "onee_san_female":  "",
+    "yandere_female":   "",
+    "default_female":   "",
+    "shonen_male":      "",
+    "cool_male":        "",
+    "gentle_male":      "",
+    "default_male":     "",
 }
 
 
 def get_archetype_voice_id(gender: str | None, personality: str | None) -> str:
-    """
-    Select a voice archetype based on character gender and personality keywords.
-    Falls back to gender-default, then global default.
-    """
+    """Select a voice archetype based on character gender and personality keywords."""
     gender_lower = (gender or "").lower()
     personality_lower = (personality or "").lower()
 
@@ -65,19 +72,100 @@ def get_archetype_voice_id(gender: str | None, personality: str | None) -> str:
     return ""
 
 
-def create_fish_tts(voice_id: str | None = None) -> TTS:
+@dataclass
+class _FishTTSOptions:
+    reference_id: str
+    format: str
+
+
+class FishTTS(tts.TTS):
+    """Fish Audio TTS using native /v1/tts endpoint."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str = "",
+        base_url: str = "",
+        reference_id: str = "",
+        response_format: str = "mp3",
+    ) -> None:
+        super().__init__(
+            capabilities=tts.TTSCapabilities(streaming=False),
+            sample_rate=SAMPLE_RATE,
+            num_channels=NUM_CHANNELS,
+        )
+        self._api_key = api_key or FISH_SPEECH_API_KEY
+        self._base_url = (base_url or FISH_SPEECH_API_URL).rstrip("/")
+        self._opts = _FishTTSOptions(
+            reference_id=reference_id or FISH_SPEECH_VOICE_ID or "",
+            format=response_format,
+        )
+
+    def update_options(self, *, reference_id: str | None = None) -> None:
+        if reference_id is not None:
+            self._opts.reference_id = reference_id
+
+    def synthesize(
+        self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
+    ) -> "FishChunkedStream":
+        return FishChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+
+    async def aclose(self) -> None:
+        pass
+
+
+class FishChunkedStream(tts.ChunkedStream):
+    def __init__(self, *, tts: FishTTS, input_text: str, conn_options: APIConnectOptions) -> None:
+        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
+        self._tts: FishTTS = tts
+        self._opts = replace(tts._opts)
+
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        url = f"{self._tts._base_url}/v1/tts"
+        headers = {
+            "Authorization": f"Bearer {self._tts._api_key}",
+            "Content-Type": "application/json",
+        }
+        body: dict = {
+            "text": self.input_text,
+            "format": self._opts.format,
+        }
+        if self._opts.reference_id:
+            body["reference_id"] = self._opts.reference_id
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30, connect=self._conn_options.timeout),
+        ) as client:
+            async with client.stream("POST", url, headers=headers, json=body) as resp:
+                if resp.status_code != 200:
+                    error_body = await resp.aread()
+                    raise Exception(
+                        f"Fish Audio TTS error {resp.status_code}: {error_body.decode()}"
+                    )
+
+                output_emitter.initialize(
+                    request_id=resp.headers.get("x-request-id", ""),
+                    sample_rate=SAMPLE_RATE,
+                    num_channels=NUM_CHANNELS,
+                    mime_type=f"audio/{self._opts.format}",
+                )
+
+                async for chunk in resp.aiter_bytes():
+                    output_emitter.push(chunk)
+
+            output_emitter.flush()
+
+
+def create_fish_tts(voice_id: str | None = None) -> FishTTS:
     """
-    Create a Fish Speech TTS instance.
+    Create a Fish Audio TTS instance.
 
     Args:
-        voice_id: Fish Speech voice model ID to use. Falls back to
-                  FISH_SPEECH_VOICE_ID env var, then "default".
+        voice_id: Fish Audio reference_id for the voice to use.
+                  Falls back to FISH_SPEECH_VOICE_ID env var.
     """
-    effective_voice = voice_id or FISH_SPEECH_VOICE_ID or "default"
-
-    return TTS(
-        model=FISH_SPEECH_MODEL,
+    return FishTTS(
         api_key=FISH_SPEECH_API_KEY,
-        base_url=f"{FISH_SPEECH_API_URL}/v1",
-        voice=effective_voice,
+        base_url=FISH_SPEECH_API_URL,
+        reference_id=voice_id or FISH_SPEECH_VOICE_ID or "",
     )
