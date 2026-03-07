@@ -1,5 +1,5 @@
 """
-Anione Voice Agent — LiveKit Agents SDK entry point.
+Anione Voice Agent — LiveKit Agents SDK v1.0 entry point.
 
 Connects to LiveKit Cloud, auto-joins rooms created by createRoomAPI,
 and runs the real-time voice pipeline:
@@ -16,17 +16,8 @@ import time
 from dataclasses import dataclass, field
 
 import httpx
-from livekit import rtc
-from livekit.agents import (
-    AutoSubscribe,
-    JobContext,
-    JobProcess,
-    WorkerOptions,
-    WorkerType,
-    cli,
-    llm,
-)
-from livekit.agents.pipeline import VoicePipelineAgent
+from livekit import agents, rtc
+from livekit.agents import AgentSession, Agent, AgentServer, room_io
 from livekit.plugins import deepgram, silero
 
 from config import (
@@ -97,7 +88,7 @@ class CallState:
     turns_since_shadow: int = 0
     # Phase 6: XP tracking
     cumulative_xp: int = 0
-    current_relationship_xp: int = 0  # loaded from metadata
+    current_relationship_xp: int = 0
     current_relationship_level: int = 1
     current_relationship_stage: str = "Stranger"
     current_mood: str = "Neutral"
@@ -118,7 +109,7 @@ async def send_data_message(room: rtc.Room, msg_type: str, data: dict):
 # ---------------------------------------------------------------------------
 # Billing loop — calls useVoiceTokensAPI every 60 seconds
 # ---------------------------------------------------------------------------
-async def billing_loop(state: CallState, ctx: JobContext, room: rtc.Room):
+async def billing_loop(state: CallState, session: AgentSession, room: rtc.Room):
     """Periodically deduct voiceMinutes via the Next.js API."""
     await asyncio.sleep(BILLING_INTERVAL_SECONDS)
 
@@ -133,7 +124,6 @@ async def billing_loop(state: CallState, ctx: JobContext, room: rtc.Room):
                 data = resp.json()
 
                 if resp.status_code == 400:
-                    # Minutes exhausted — send notification and shut down
                     logger.warning(
                         "Voice minutes exhausted for call %s — shutting down",
                         state.call_id,
@@ -141,7 +131,7 @@ async def billing_loop(state: CallState, ctx: JobContext, room: rtc.Room):
                     await send_data_message(room, "minutes_exhausted", {
                         "remainingMinutes": 0,
                     })
-                    await ctx.shutdown()
+                    await session.aclose()
                     return
 
                 if resp.status_code != 200:
@@ -154,7 +144,6 @@ async def billing_loop(state: CallState, ctx: JobContext, room: rtc.Room):
                         remaining,
                     )
 
-                    # Warn at 1 minute remaining
                     if remaining == 1:
                         await send_data_message(room, "minutes_warning", {
                             "remainingMinutes": 1,
@@ -202,18 +191,13 @@ async def maybe_shadow_summarize(state: CallState):
 
 
 # ---------------------------------------------------------------------------
-# Prewarm — preload heavy models at worker startup (not per-room)
+# Server and session lifecycle
 # ---------------------------------------------------------------------------
-def prewarm(proc: JobProcess):
-    """Load Silero VAD model into RAM on server start for fast cold-starts."""
-    proc.userdata["vad"] = silero.VAD.load()
-    logger.info("Prewarm complete: Silero VAD loaded")
+server = AgentServer()
 
 
-# ---------------------------------------------------------------------------
-# Session lifecycle
-# ---------------------------------------------------------------------------
-async def _entrypoint(ctx: JobContext):
+@server.rtc_session(agent_name="anione-voice")
+async def entrypoint(ctx: agents.JobContext):
     """Called when the agent joins a room."""
 
     state = CallState(call_start_time=time.time())
@@ -253,8 +237,6 @@ async def _entrypoint(ctx: JobContext):
             nsfw_enabled = meta.get("nsfwEnabled", False)
             system_prompt = build_voice_system_prompt(char_ctx, nsfw_enabled)
             state.character_name = char_ctx.character_name or state.character_name
-            # Load starting XP from the UserCharacter (fetched via context_loader)
-            # For now we compute from level; Phase 5+ context_loader can return exact XP
             logger.info(
                 "Voice prompt built: %d chars for %s",
                 len(system_prompt),
@@ -263,21 +245,13 @@ async def _entrypoint(ctx: JobContext):
         except Exception:
             logger.exception("Failed to load character context — using fallback prompt")
 
-    # Build initial chat context
-    initial_ctx = llm.ChatContext()
-    initial_ctx.append(role="system", text=system_prompt)
-
     # Resolve voice profile for TTS
     voice_id = ""
     if char_ctx:
-        # Priority: explicit voice_profile_id > reference URL > archetype fallback
         voice_id = char_ctx.voice_profile_id
         if not voice_id and char_ctx.voice_reference_url:
-            # Custom reference audio — use the URL as the voice ID
-            # Fish Speech accepts reference audio URLs as voice identifiers
             voice_id = char_ctx.voice_reference_url
         if not voice_id:
-            # Fallback to archetype detection from persona gender/personality
             voice_id = get_archetype_voice_id(
                 char_ctx.persona_gender,
                 char_ctx.persona_personality,
@@ -285,84 +259,86 @@ async def _entrypoint(ctx: JobContext):
         if voice_id:
             logger.info("Voice profile resolved: %s", voice_id[:50])
 
-    # Build voice pipeline with prewarmed VAD
-    voice_assistant = VoicePipelineAgent(
-        vad=ctx.proc.userdata["vad"],
+    # Create the Agent with character-specific instructions
+    character_agent = Agent(instructions=system_prompt)
+
+    # Create AgentSession with pipeline components
+    session = AgentSession(
         stt=deepgram.STT(),
         llm=create_groq_llm(),
         tts=create_fish_tts(voice_id=voice_id or None),
-        chat_ctx=initial_ctx,
+        vad=silero.VAD.load(),
+        allow_interruptions=True,
+        min_endpointing_delay=0.5,
     )
 
-    # --- Transcript tracking + XP via pipeline events ---
-
-    @voice_assistant.on("user_speech_committed")
-    def on_user_speech(msg: llm.ChatMessage):
-        content = msg.content or ""
+    # --- Transcript tracking via conversation_item_added ---
+    @session.on("conversation_item_added")
+    def on_conversation_item(event):
+        item = event.item
+        content = item.text_content or ""
         if not content.strip():
             return
 
-        state.transcript.append(
-            TranscriptTurn(role="user", content=content, timestamp=time.time())
-        )
-        state.turn_index += 1
-        state.turns_since_shadow += 1
-        logger.info("[Turn %d] User: %s", state.turn_index, content[:100])
+        if item.role == "user":
+            state.transcript.append(
+                TranscriptTurn(role="user", content=content, timestamp=time.time())
+            )
+            state.turn_index += 1
+            state.turns_since_shadow += 1
+            logger.info("[Turn %d] User: %s", state.turn_index, content[:100])
 
-        # XP tracking — fast pattern classification, no API call
-        intent, xp_delta = calculate_xp_delta(content)
-        old_total_xp = state.current_relationship_xp + state.cumulative_xp
-        state.cumulative_xp += xp_delta
-        new_total_xp = state.current_relationship_xp + state.cumulative_xp
-
-        logger.info(
-            "[XP] intent=%s, delta=+%d, cumulative=%d, total=%d",
-            intent, xp_delta, state.cumulative_xp, new_total_xp,
-        )
-
-        # Check for relationship stage change
-        stage_change = check_stage_change(old_total_xp, new_total_xp)
-        if stage_change:
-            state.current_relationship_level = stage_change["new_level"]
-            state.current_relationship_stage = stage_change["new_stage"]
+            # XP tracking — fast pattern classification, no API call
+            intent, xp_delta = calculate_xp_delta(content)
+            old_total_xp = state.current_relationship_xp + state.cumulative_xp
+            state.cumulative_xp += xp_delta
+            new_total_xp = state.current_relationship_xp + state.cumulative_xp
 
             logger.info(
-                "[STAGE CHANGE] %s -> %s (level %d -> %d)",
-                stage_change["old_stage"],
-                stage_change["new_stage"],
-                stage_change["old_level"],
-                stage_change["new_level"],
+                "[XP] intent=%s, delta=+%d, cumulative=%d, total=%d",
+                intent, xp_delta, state.cumulative_xp, new_total_xp,
             )
 
-            # Send data message to frontend for toast notification
-            asyncio.create_task(send_data_message(room, "level_up", {
-                "newLevel": stage_change["new_level"],
-                "newStage": stage_change["new_stage"],
-                "oldStage": stage_change["old_stage"],
-                "totalXP": new_total_xp,
-            }))
+            # Check for relationship stage change
+            stage_change = check_stage_change(old_total_xp, new_total_xp)
+            if stage_change:
+                state.current_relationship_level = stage_change["new_level"]
+                state.current_relationship_stage = stage_change["new_stage"]
 
-        # Shadow summarization check (non-blocking)
-        asyncio.create_task(maybe_shadow_summarize(state))
+                logger.info(
+                    "[STAGE CHANGE] %s -> %s (level %d -> %d)",
+                    stage_change["old_stage"],
+                    stage_change["new_stage"],
+                    stage_change["old_level"],
+                    stage_change["new_level"],
+                )
 
-    @voice_assistant.on("agent_speech_committed")
-    def on_agent_speech(msg: llm.ChatMessage):
-        content = msg.content or ""
-        if content.strip():
+                asyncio.create_task(send_data_message(room, "level_up", {
+                    "newLevel": stage_change["new_level"],
+                    "newStage": stage_change["new_stage"],
+                    "oldStage": stage_change["old_stage"],
+                    "totalXP": new_total_xp,
+                }))
+
+            # Shadow summarization check (non-blocking)
+            asyncio.create_task(maybe_shadow_summarize(state))
+
+        elif item.role == "assistant":
+            was_interrupted = getattr(item, "interrupted", False)
             state.transcript.append(
-                TranscriptTurn(role="assistant", content=content, timestamp=time.time())
+                TranscriptTurn(
+                    role="assistant",
+                    content=content,
+                    timestamp=time.time(),
+                    was_interrupted=was_interrupted,
+                )
             )
             state.turns_since_shadow += 1
             logger.info("[Turn %d] Agent: %s", state.turn_index, content[:100])
 
-    @voice_assistant.on("agent_speech_interrupted")
-    def on_agent_interrupted(msg: llm.ChatMessage):
-        if state.transcript and state.transcript[-1].role == "assistant":
-            state.transcript[-1].was_interrupted = True
-            logger.info("[Turn %d] Agent interrupted", state.turn_index)
-
-    # Register shutdown callback for cleanup and post-call archival
-    async def on_shutdown():
+    # --- Cleanup on session close ---
+    @session.on("close")
+    async def on_close(event):
         # Cleanup billing
         if state.billing_task and not state.billing_task.done():
             state.billing_task.cancel()
@@ -395,26 +371,19 @@ async def _entrypoint(ctx: JobContext):
             except Exception:
                 logger.exception("Post-call archival failed for call %s", state.call_id)
 
-    ctx.add_shutdown_callback(on_shutdown)
-
     # Start billing loop
     if state.call_id:
-        state.billing_task = asyncio.create_task(billing_loop(state, ctx, room))
+        state.billing_task = asyncio.create_task(billing_loop(state, session, room))
 
-    # Start the voice pipeline — non-blocking, framework keeps job alive
-    # until all participants leave the room or ctx.shutdown() is called
-    voice_assistant.start(ctx.room)
+    # Start the session — framework keeps job alive until room empties
+    await session.start(
+        room=ctx.room,
+        agent=character_agent,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Worker entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=_entrypoint,
-            prewarm_fnc=prewarm,
-            worker_type=WorkerType.ROOM,
-            auto_subscribe=AutoSubscribe.AUDIO_ONLY,
-        ),
-    )
+    agents.cli.run_app(server)
