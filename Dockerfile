@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Pre-download VAD model at build time (not at runtime)
-RUN python agent.py download-files
+# Pre-download Silero VAD model at build time
+# Can't use `agent.py download-files` because config.py requires env vars
+RUN python -c "from livekit.plugins.silero import VAD; VAD.load()"
 
 CMD ["python", "agent.py", "start"]
