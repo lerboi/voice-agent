@@ -12,6 +12,7 @@ token billing, XP tracking, relationship stage changes.
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -22,8 +23,10 @@ from livekit.plugins import deepgram, silero
 
 from config import (
     BILLING_INTERVAL_SECONDS,
+    INACTIVITY_TIMEOUT_SECONDS,
     NEXTJS_API_URL,
     SHADOW_SUMMARY_INTERVAL,
+    TURN_CHECKPOINT_INTERVAL,
     VOICE_AGENT_API_KEY,
 )
 from plugins.groq_llm import create_groq_llm
@@ -32,6 +35,7 @@ from services.context_loader import (
     load_character_context,
     build_voice_system_prompt,
     get_behavior_tier,
+    supabase,
 )
 from services.shadow_summarizer import generate_shadow_summary
 from services.transcript_archiver import archive_call
@@ -45,6 +49,18 @@ from services.xp_tracker import (
 logger = logging.getLogger("anione-voice-agent")
 logger.setLevel(logging.INFO)
 
+# Module-level set to prevent background tasks from being garbage-collected.
+# Tasks auto-remove themselves via add_done_callback when complete.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _create_safe_task(coro) -> asyncio.Task:
+    """Create an asyncio task and store in _background_tasks to prevent GC."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 # ---------------------------------------------------------------------------
 # Fallback test prompt (used only when metadata is missing)
@@ -56,8 +72,23 @@ TEST_SYSTEM_PROMPT = (
     "and emotional interjections. Never use asterisks, markdown, or text "
     "formatting — this is spoken dialogue only. "
     "React to interruptions naturally. Match the user's energy and pacing. "
-    "Be warm, expressive, and stay in character at all times."
+    "Be warm, expressive, and stay in character at all times. "
+    "Prefix each sentence with an emotion tag like (happy) or (excited) to convey tone."
 )
+
+# Regex to strip Fish Speech emotion/tone tags from text before storing in transcript.
+# Matches tags like (happy), (laughing), (soft tone) etc.
+_EMOTION_TAG_RE = re.compile(r"\((?:happy|sad|angry|excited|calm|nervous|confident|surprised|"
+                              r"satisfied|delighted|scared|worried|upset|frustrated|depressed|"
+                              r"empathetic|embarrassed|disgusted|moved|proud|relaxed|grateful|"
+                              r"curious|sarcastic|disdainful|unhappy|anxious|hysterical|"
+                              r"indifferent|uncertain|doubtful|confused|disappointed|regretful|"
+                              r"guilty|ashamed|jealous|envious|hopeful|optimistic|pessimistic|"
+                              r"nostalgic|lonely|bored|contemptuous|sympathetic|compassionate|"
+                              r"determined|resigned|in a hurry tone|shouting|screaming|"
+                              r"whispering|soft tone|laughing|chuckling|sobbing|crying loudly|"
+                              r"sighing|groaning|panting|gasping|yawning|snoring|break|"
+                              r"long-break)\)\s*")
 
 
 # ---------------------------------------------------------------------------
@@ -82,10 +113,15 @@ class CallState:
     transcript: list[TranscriptTurn] = field(default_factory=list)
     turn_index: int = 0
     billing_task: asyncio.Task | None = None
+    inactivity_task: asyncio.Task | None = None
     call_start_time: float = 0.0
+    last_user_activity: float = 0.0
     shadow_summary: str = ""
     shadow_summary_count: int = 0
     turns_since_shadow: int = 0
+    shadow_summary_in_progress: bool = False
+    last_checkpoint_index: int = 0
+    checkpoint_in_progress: bool = False
     # Phase 6: XP tracking
     cumulative_xp: int = 0
     current_relationship_xp: int = 0
@@ -156,12 +192,48 @@ async def billing_loop(state: CallState, session: AgentSession, room: rtc.Room):
 
 
 # ---------------------------------------------------------------------------
+# Inactivity monitor — ends call if user is silent too long
+# ---------------------------------------------------------------------------
+async def inactivity_monitor(state: CallState, session: AgentSession, room: rtc.Room):
+    """End the call if the user has been inactive for INACTIVITY_TIMEOUT_SECONDS."""
+    warning_sent = False
+    # Warning 30s before timeout
+    warning_threshold = max(INACTIVITY_TIMEOUT_SECONDS - 30, 30)
+
+    while True:
+        await asyncio.sleep(30)  # Check every 30s
+        idle_seconds = time.time() - state.last_user_activity
+
+        if idle_seconds >= INACTIVITY_TIMEOUT_SECONDS:
+            logger.info(
+                "Inactivity timeout for call %s (%ds idle)",
+                state.call_id,
+                int(idle_seconds),
+            )
+            await send_data_message(room, "inactivity_timeout", {})
+            await session.aclose()
+            return
+
+        if idle_seconds >= warning_threshold and not warning_sent:
+            warning_sent = True
+            logger.info("Inactivity warning for call %s", state.call_id)
+            await send_data_message(room, "inactivity_warning", {
+                "secondsRemaining": int(INACTIVITY_TIMEOUT_SECONDS - idle_seconds),
+            })
+
+        if idle_seconds < warning_threshold:
+            warning_sent = False  # Reset if user became active again
+
+
+# ---------------------------------------------------------------------------
 # Shadow summarization — runs in background every N turns
 # ---------------------------------------------------------------------------
 async def maybe_shadow_summarize(state: CallState):
     """Check if shadow summarization should trigger and run it."""
     if state.turns_since_shadow < SHADOW_SUMMARY_INTERVAL:
         return
+    if state.shadow_summary_in_progress:
+        return  # Another summarization is in-flight; turns will be caught next cycle
 
     start_idx = len(state.transcript) - state.turns_since_shadow
     recent_turns = [
@@ -172,22 +244,71 @@ async def maybe_shadow_summarize(state: CallState):
     if not recent_turns:
         return
 
-    state.turns_since_shadow = 0
+    state.shadow_summary_in_progress = True
+    saved_turns_count = state.turns_since_shadow
+    state.turns_since_shadow = 0  # Reset so new turns during summarization count from 0
 
-    new_summary = await generate_shadow_summary(
-        existing_summary=state.shadow_summary,
-        recent_turns=recent_turns,
-        character_name=state.character_name,
-    )
+    try:
+        new_summary = await generate_shadow_summary(
+            existing_summary=state.shadow_summary,
+            recent_turns=recent_turns,
+            character_name=state.character_name,
+        )
 
-    if new_summary:
-        state.shadow_summary = new_summary
-        state.shadow_summary_count += 1
+        if new_summary:
+            state.shadow_summary = new_summary
+            state.shadow_summary_count += 1
+            logger.info(
+                "Shadow summary #%d generated for call %s",
+                state.shadow_summary_count,
+                state.call_id,
+            )
+        else:
+            # Summarization failed — restore turns so they're retried next cycle
+            state.turns_since_shadow += saved_turns_count
+    finally:
+        state.shadow_summary_in_progress = False
+
+
+# ---------------------------------------------------------------------------
+# Turn checkpoint — writes turns to voice_call_turns every N turns
+# ---------------------------------------------------------------------------
+async def maybe_checkpoint_turns(state: CallState):
+    """Write unsaved turns to voice_call_turns table for crash safety."""
+    total_turns = len(state.transcript)
+    if total_turns - state.last_checkpoint_index < TURN_CHECKPOINT_INTERVAL:
+        return
+    if not state.call_id:
+        return
+    if state.checkpoint_in_progress:
+        return  # Another checkpoint is in-flight; will catch up next cycle
+
+    state.checkpoint_in_progress = True
+    try:
+        new_turns = state.transcript[state.last_checkpoint_index:]
+        records = []
+        for i, turn in enumerate(new_turns):
+            records.append({
+                "call_id": state.call_id,
+                "memory_space_id": state.memory_space_id,
+                "turn_index": state.last_checkpoint_index + i,
+                "role": turn.role,
+                "content": turn.content,
+                "was_interrupted": turn.was_interrupted,
+                "metadata": {},
+            })
+
+        supabase.table("voice_call_turns").insert(records).execute()
+        state.last_checkpoint_index = total_turns
         logger.info(
-            "Shadow summary #%d generated for call %s",
-            state.shadow_summary_count,
+            "Checkpoint: %d turns saved for call %s",
+            len(records),
             state.call_id,
         )
+    except Exception:
+        logger.exception("Turn checkpoint failed for call %s", state.call_id)
+    finally:
+        state.checkpoint_in_progress = False
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +344,7 @@ server = AgentServer()
 async def entrypoint(ctx: agents.JobContext):
     """Called when the agent joins a room."""
 
-    state = CallState(call_start_time=time.time())
+    state = CallState(call_start_time=time.time(), last_user_activity=time.time())
     room = ctx.room
 
     # Parse room metadata set by createRoomAPI
@@ -304,6 +425,7 @@ async def entrypoint(ctx: agents.JobContext):
             return
 
         if item.role == "user":
+            state.last_user_activity = time.time()
             state.transcript.append(
                 TranscriptTurn(role="user", content=content, timestamp=time.time())
             )
@@ -336,7 +458,7 @@ async def entrypoint(ctx: agents.JobContext):
                     stage_change["new_level"],
                 )
 
-                asyncio.create_task(send_data_message(room, "level_up", {
+                _create_safe_task(send_data_message(room, "level_up", {
                     "newLevel": stage_change["new_level"],
                     "newStage": stage_change["new_stage"],
                     "oldStage": stage_change["old_stage"],
@@ -344,27 +466,34 @@ async def entrypoint(ctx: agents.JobContext):
                 }))
 
             # Shadow summarization check (non-blocking)
-            asyncio.create_task(maybe_shadow_summarize(state))
+            _create_safe_task(maybe_shadow_summarize(state))
 
         elif item.role == "assistant":
             was_interrupted = getattr(item, "interrupted", False)
+            # Strip Fish Speech emotion tags before storing — TTS has already consumed them
+            clean_content = _EMOTION_TAG_RE.sub("", content).strip() or content
             state.transcript.append(
                 TranscriptTurn(
                     role="assistant",
-                    content=content,
+                    content=clean_content,
                     timestamp=time.time(),
                     was_interrupted=was_interrupted,
                 )
             )
             state.turns_since_shadow += 1
-            logger.info("[Turn %d] Agent: %s", state.turn_index, content[:100])
+            logger.info("[Turn %d] Agent: %s", state.turn_index, clean_content[:100])
+
+            # Periodic turn checkpoint for crash safety (non-blocking)
+            _create_safe_task(maybe_checkpoint_turns(state))
 
     # --- Cleanup on session close (must be sync — SDK requirement) ---
     @session.on("close")
     def on_close(event):
-        # Cleanup billing
+        # Cleanup billing and inactivity monitor
         if state.billing_task and not state.billing_task.done():
             state.billing_task.cancel()
+        if state.inactivity_task and not state.inactivity_task.done():
+            state.inactivity_task.cancel()
 
         call_duration = int(time.time() - state.call_start_time)
         logger.info(
@@ -375,13 +504,17 @@ async def entrypoint(ctx: agents.JobContext):
             state.cumulative_xp,
         )
 
-        # Schedule post-call archival as a background task
+        # Schedule post-call archival as a background task.
+        # Store in _background_tasks to prevent GC before completion.
         if state.call_id and state.transcript:
-            asyncio.create_task(_run_archival(state, meta, call_duration))
+            task = asyncio.create_task(_run_archival(state, meta, call_duration))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
 
-    # Start billing loop
+    # Start billing loop and inactivity monitor
     if state.call_id:
         state.billing_task = asyncio.create_task(billing_loop(state, session, room))
+        state.inactivity_task = asyncio.create_task(inactivity_monitor(state, session, room))
 
     # Start the session — framework keeps job alive until room empties
     await session.start(

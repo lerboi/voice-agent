@@ -12,6 +12,7 @@ Voice turns go into the SAME messages table with SAME memory_space_id
 as text chat. Voice summaries use memory_type='conversation_summary'.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -101,9 +102,11 @@ async def archive_call(
         contents = [t.content for t in transcript]
 
         # Batch embed via Voyage AI (1-2 API calls for entire batch)
+        # Runs in thread pool to avoid blocking the event loop
         embeddings = None
         try:
-            result = voyage_client.embed(
+            result = await asyncio.to_thread(
+                voyage_client.embed,
                 texts=contents,
                 model=VOYAGE_MODEL,
                 input_type="document",
@@ -155,10 +158,11 @@ async def archive_call(
                 call_duration_seconds, len(transcript), cumulative_xp,
             )
 
-            # Embed the summary
+            # Embed the summary (thread pool to avoid blocking event loop)
             summary_embedding = None
             try:
-                result = voyage_client.embed(
+                result = await asyncio.to_thread(
+                    voyage_client.embed,
                     texts=[final_summary],
                     model=VOYAGE_MODEL,
                     input_type="document",
@@ -195,16 +199,22 @@ async def archive_call(
         logger.exception("Failed to generate/store call summary")
 
     # ---------------------------------------------------------------
-    # STEP 4: Re-extract user_fact entries from transcript
+    # STEP 4: Extract user_fact entries from transcript (additive)
+    # Skip for short calls — not enough content to extract meaningful facts,
+    # and we must NOT delete existing facts accumulated from text chat.
     # ---------------------------------------------------------------
-    try:
-        await _extract_user_facts(
-            transcript, memory_space_id, user_id,
-            character_id, custom_character_id,
-        )
-        logger.info("Step 4: user_fact extraction complete")
-    except Exception:
-        logger.warning("User fact extraction failed (non-blocking)")
+    user_turn_count = sum(1 for t in transcript if t.role == "user")
+    if user_turn_count >= 5:
+        try:
+            await _extract_user_facts(
+                transcript, memory_space_id, user_id,
+                character_id, custom_character_id,
+            )
+            logger.info("Step 4: user_fact extraction complete")
+        except Exception:
+            logger.warning("User fact extraction failed (non-blocking)")
+    else:
+        logger.info("Step 4: skipped user_fact extraction (%d user turns < 5)", user_turn_count)
 
     # ---------------------------------------------------------------
     # Update UserCharacter relationship state
@@ -362,21 +372,34 @@ OUTPUT (JSON only):
             logger.info("No user facts extracted from voice transcript")
             return
 
-        # Delete all existing user_fact for this space
-        supabase.table("memories").delete().eq(
-            "memory_space_id", memory_space_id
-        ).eq("memory_type", "user_fact").execute()
+        # Voice archival is ADDITIVE — we never delete text-chat-derived facts.
+        # Text chat's summarizer.js handles its own delete-and-reinsert cycle.
+        # Fetch existing fact keys so we only add NEW facts (no duplicates).
+        existing_keys = set()
+        try:
+            existing = supabase.table("memories").select("metadata").eq(
+                "memory_space_id", memory_space_id
+            ).eq("memory_type", "user_fact").execute()
+            for row in (existing.data or []):
+                key = (row.get("metadata") or {}).get("fact_key")
+                if key:
+                    existing_keys.add(key)
+        except Exception:
+            logger.warning("Failed to fetch existing fact keys — will insert all")
 
-        # Store each fact
+        # Store only new facts (skip keys that already exist)
         fact_records = []
         for fact in facts:
             if not fact.get("key") or not fact.get("sentence"):
                 continue
+            if fact["key"] in existing_keys:
+                continue
 
-            # Embed the fact
+            # Embed the fact (thread pool to avoid blocking event loop)
             embedding = None
             try:
-                result = voyage_client.embed(
+                result = await asyncio.to_thread(
+                    voyage_client.embed,
                     texts=[fact["sentence"]],
                     model=VOYAGE_MODEL,
                     input_type="document",
