@@ -32,7 +32,7 @@ from config import (
 from plugins.groq_llm import create_groq_llm
 from plugins.fish_tts import create_fish_tts, get_archetype_voice_id
 from services.context_loader import (
-    load_character_context,
+    load_character_context_sync,
     build_voice_system_prompt,
     get_behavior_tier,
     supabase,
@@ -347,10 +347,21 @@ async def entrypoint(ctx: agents.JobContext):
     state = CallState(call_start_time=time.time(), last_user_activity=time.time())
     room = ctx.room
 
-    # Parse room metadata set by createRoomAPI
+    # Parse room metadata set by createRoomAPI.
+    # The agent may join before metadata propagates — wait up to 5s for it.
     meta = {}
     raw_metadata = room.metadata
-    if raw_metadata:
+    if not raw_metadata:
+        logger.info("Room metadata empty on join — waiting for propagation...")
+        for _ in range(10):
+            await asyncio.sleep(0.5)
+            raw_metadata = room.metadata
+            if raw_metadata:
+                break
+
+    if not raw_metadata:
+        logger.error("Room metadata still empty after 5s — using fallback prompt")
+    else:
         try:
             meta = json.loads(raw_metadata)
             state.call_id = meta.get("callId", "")
@@ -378,7 +389,7 @@ async def entrypoint(ctx: agents.JobContext):
     nsfw_enabled = False
     if meta:
         try:
-            char_ctx = await load_character_context(meta)
+            char_ctx = await asyncio.to_thread(load_character_context_sync, meta)
             nsfw_enabled = meta.get("nsfwEnabled", False)
             system_prompt = build_voice_system_prompt(char_ctx, nsfw_enabled)
             state.character_name = char_ctx.character_name or state.character_name
@@ -389,6 +400,8 @@ async def entrypoint(ctx: agents.JobContext):
             )
         except Exception:
             logger.exception("Failed to load character context — using fallback prompt")
+    else:
+        logger.error("No metadata available — agent will use TEST_SYSTEM_PROMPT")
 
     # Resolve voice profile for TTS
     voice_id = ""

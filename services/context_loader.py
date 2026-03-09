@@ -109,7 +109,7 @@ class CharacterContext:
     persona_personality: str = ""     # For archetype selection fallback
 
 
-async def load_character_context(metadata: dict) -> CharacterContext:
+def load_character_context_sync(metadata: dict) -> CharacterContext:
     """
     Fetch character persona + relationship + memories from Supabase.
 
