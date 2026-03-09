@@ -375,6 +375,7 @@ async def entrypoint(ctx: agents.JobContext):
     # --- Load character context from Supabase ---
     system_prompt = TEST_SYSTEM_PROMPT
     char_ctx = None
+    nsfw_enabled = False
     if meta:
         try:
             char_ctx = await load_character_context(meta)
@@ -449,6 +450,17 @@ async def entrypoint(ctx: agents.JobContext):
             if stage_change:
                 state.current_relationship_level = stage_change["new_level"]
                 state.current_relationship_stage = stage_change["new_stage"]
+
+                # Rebuild system prompt with the new behavior tier
+                if char_ctx:
+                    new_tier = get_behavior_tier(stage_change["new_level"])
+                    char_ctx.behavior_prompt = new_tier["prompt"]
+                    char_ctx.relationship_stage = stage_change["new_stage"]
+                    character_agent.instructions = build_voice_system_prompt(char_ctx, nsfw_enabled)
+                    logger.info(
+                        "[PROMPT] Rebuilt for new stage: %s",
+                        stage_change["new_stage"],
+                    )
 
                 logger.info(
                     "[STAGE CHANGE] %s -> %s (level %d -> %d)",
