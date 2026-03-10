@@ -14,6 +14,7 @@ as text chat. Voice summaries use memory_type='conversation_summary'.
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 from openai import AsyncOpenAI
@@ -38,6 +39,59 @@ groq_client = AsyncOpenAI(
     api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1",
 )
+
+
+async def _voyage_embed_with_retry(texts: list[str], max_retries: int = 2) -> list | None:
+    """Embed texts via Voyage AI with retry logic. Returns embeddings list or None."""
+    for attempt in range(max_retries + 1):
+        try:
+            result = await asyncio.to_thread(
+                voyage_client.embed,
+                texts=texts,
+                model=VOYAGE_MODEL,
+                input_type="document",
+            )
+            return result.embeddings
+        except Exception:
+            if attempt < max_retries:
+                wait = (attempt + 1) * 1.5  # 1.5s, 3s
+                logger.warning(
+                    "Voyage embedding attempt %d/%d failed — retrying in %.1fs",
+                    attempt + 1, max_retries + 1, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.warning(
+                    "Voyage embedding failed after %d attempts", max_retries + 1,
+                )
+    return None
+
+
+async def _mark_archival_failed(call_id: str, error_msg: str):
+    """Mark a voice_calls record with archival failure metadata for retry."""
+    try:
+        # Merge into existing metadata rather than overwriting
+        vc = await asyncio.to_thread(
+            lambda: supabase.table("voice_calls")
+            .select("metadata")
+            .eq("id", call_id)
+            .single()
+            .execute()
+        )
+        existing_meta = (vc.data or {}).get("metadata") or {}
+        existing_meta["archival_status"] = "failed"
+        existing_meta["archival_error"] = str(error_msg)[:500]
+        existing_meta["archival_failed_at"] = datetime.now(timezone.utc).isoformat()
+
+        await asyncio.to_thread(
+            lambda: supabase.table("voice_calls")
+            .update({"metadata": existing_meta})
+            .eq("id", call_id)
+            .execute()
+        )
+        logger.info("Marked call %s archival as failed", call_id)
+    except Exception:
+        logger.exception("Failed to mark archival failure on call %s", call_id)
 
 
 async def archive_call(
@@ -78,6 +132,9 @@ async def archive_call(
         call_id, len(transcript), call_duration_seconds,
     )
 
+    embeddings_failed = False  # Track across all steps for metadata marking
+    critical_failure = False   # Track if a critical step (turns insert or summary) failed
+
     # ---------------------------------------------------------------
     # STEP 1: Lock lastMemorySync FIRST (prevent summarizer race)
     # ---------------------------------------------------------------
@@ -103,19 +160,10 @@ async def archive_call(
     try:
         contents = [t.content for t in transcript]
 
-        # Batch embed via Voyage AI (1-2 API calls for entire batch)
-        # Runs in thread pool to avoid blocking the event loop
-        embeddings = None
-        try:
-            result = await asyncio.to_thread(
-                voyage_client.embed,
-                texts=contents,
-                model=VOYAGE_MODEL,
-                input_type="document",
-            )
-            embeddings = result.embeddings
-        except Exception:
-            logger.warning("Voyage batch embedding failed — inserting without embeddings")
+        # Batch embed via Voyage AI with retry (1-2 API calls for entire batch)
+        embeddings = await _voyage_embed_with_retry(contents)
+        if embeddings is None:
+            embeddings_failed = True
 
         records = []
         for i, turn in enumerate(transcript):
@@ -147,6 +195,7 @@ async def archive_call(
 
     except Exception:
         logger.exception("Failed to insert voice turns into messages")
+        critical_failure = True
 
     # ---------------------------------------------------------------
     # STEP 2b: Insert voice call summary card into messages table
@@ -209,18 +258,11 @@ async def archive_call(
                 call_duration_seconds, len(transcript), cumulative_xp,
             )
 
-            # Embed the summary (thread pool to avoid blocking event loop)
-            summary_embedding = None
-            try:
-                result = await asyncio.to_thread(
-                    voyage_client.embed,
-                    texts=[final_summary],
-                    model=VOYAGE_MODEL,
-                    input_type="document",
-                )
-                summary_embedding = result.embeddings[0]
-            except Exception:
-                logger.warning("Summary embedding failed")
+            # Embed the summary with retry
+            summary_embeddings = await _voyage_embed_with_retry([final_summary])
+            summary_embedding = summary_embeddings[0] if summary_embeddings else None
+            if summary_embedding is None:
+                embeddings_failed = True
 
             memory_record = {
                 "user_id": user_id,
@@ -250,6 +292,7 @@ async def archive_call(
 
     except Exception:
         logger.exception("Failed to generate/store call summary")
+        critical_failure = True
 
     # ---------------------------------------------------------------
     # STEP 4: Extract user_fact entries from transcript (additive)
@@ -312,6 +355,31 @@ async def archive_call(
 
     except Exception:
         logger.exception("Failed to update UserCharacter post-call")
+
+    # Mark critical failure on the voice_calls record for retry
+    if critical_failure:
+        await _mark_archival_failed(call_id, "Critical archival step failed (turns insert or summary)")
+
+    # Mark embeddings_failed on the voice_calls record so they can be backfilled
+    if embeddings_failed and not critical_failure:
+        try:
+            vc = await asyncio.to_thread(
+                lambda: supabase.table("voice_calls")
+                .select("metadata")
+                .eq("id", call_id)
+                .single()
+                .execute()
+            )
+            meta = (vc.data or {}).get("metadata") or {}
+            meta["embeddings_failed"] = True
+            await asyncio.to_thread(
+                lambda: supabase.table("voice_calls")
+                .update({"metadata": meta})
+                .eq("id", call_id)
+                .execute()
+            )
+        except Exception:
+            logger.warning("Failed to mark embeddings_failed on call %s", call_id)
 
     logger.info("Archival complete for call %s", call_id)
 
@@ -454,18 +522,9 @@ OUTPUT (JSON only):
             if fact["key"] in existing_keys:
                 continue
 
-            # Embed the fact (thread pool to avoid blocking event loop)
-            embedding = None
-            try:
-                result = await asyncio.to_thread(
-                    voyage_client.embed,
-                    texts=[fact["sentence"]],
-                    model=VOYAGE_MODEL,
-                    input_type="document",
-                )
-                embedding = result.embeddings[0]
-            except Exception:
-                pass
+            # Embed the fact with retry
+            fact_embeddings = await _voyage_embed_with_retry([fact["sentence"]])
+            embedding = fact_embeddings[0] if fact_embeddings else None
 
             record = {
                 "user_id": user_id,

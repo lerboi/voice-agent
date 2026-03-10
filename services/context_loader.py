@@ -220,7 +220,7 @@ def load_character_context_sync(metadata: dict) -> CharacterContext:
 
     # 4. Recent messages (last 5 for voice context — smaller than text chat's budget)
     try:
-        rm = supabase.table("messages").select("role, content").eq(
+        rm = supabase.table("messages").select("role, content, metadata").eq(
             "memory_space_id", memory_space_id
         ).in_("role", ["user", "assistant"]).order(
             "created_at", desc=True
@@ -273,6 +273,8 @@ This is a SPOKEN conversation, not text.
 - Keep responses to 1-3 sentences unless asked for more detail.
 - Use natural speech: contractions, filler words (um, well, hmm), emotional interjections.
 - NEVER use asterisks, markdown, brackets, or text formatting.
+- NEVER describe physical actions, gestures, or expressions — no *smirks*, *blushes*, *leans closer*, etc.
+- NEVER use parentheses for anything other than the listed emotion tags below. Tags like (smirking), (blushing), (grinning), (winking), (teasing), (pouting) are NOT valid and will be spoken aloud — do NOT use them.
 - React to interruptions naturally: "Oh, sorry — go ahead" or resume where you left off.
 - Match the user's energy and pacing.
 - No quotation marks around speech.
@@ -337,11 +339,14 @@ Even if rejecting an advance, do it playfully or shyly — never cold shutdowns.
         memory_parts.append(f"[Known about user]: {facts_str}")
 
     if ctx.recent_messages:
-        recent_str = "\n".join(
-            f"{'User' if m['role'] == 'user' else ctx.character_name}: {m['content']}"
-            for m in ctx.recent_messages[-5:]
-        )
-        memory_parts.append(f"[Recent conversation]:\n{recent_str}")
+        recent_lines = []
+        for m in ctx.recent_messages[-5:]:
+            speaker = "User" if m["role"] == "user" else ctx.character_name
+            # Annotate source so the character knows how previous conversations happened
+            meta = m.get("metadata") or {}
+            source_tag = "[voice call]" if meta.get("source") == "voice_call" else "[text]"
+            recent_lines.append(f"{speaker} {source_tag}: {m['content']}")
+        memory_parts.append(f"[Recent conversation]:\n" + "\n".join(recent_lines))
 
     if memory_parts:
         prompt += "\n### SHARED HISTORY\n"
