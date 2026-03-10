@@ -10,7 +10,7 @@ LIVEKIT_API_SECRET = os.environ["LIVEKIT_API_SECRET"]
 
 # Groq (OpenAI-compatible)
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
 # Deepgram
 DEEPGRAM_API_KEY = os.environ["DEEPGRAM_API_KEY"]

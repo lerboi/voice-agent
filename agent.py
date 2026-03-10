@@ -298,7 +298,9 @@ async def maybe_checkpoint_turns(state: CallState):
                 "metadata": {},
             })
 
-        supabase.table("voice_call_turns").insert(records).execute()
+        await asyncio.to_thread(
+            lambda: supabase.table("voice_call_turns").insert(records).execute()
+        )
         state.last_checkpoint_index = total_turns
         logger.info(
             "Checkpoint: %d turns saved for call %s",
@@ -347,41 +349,57 @@ async def entrypoint(ctx: agents.JobContext):
     state = CallState(call_start_time=time.time(), last_user_activity=time.time())
     room = ctx.room
 
-    # Parse room metadata set by createRoomAPI.
-    # The agent may join before metadata propagates — wait up to 5s for it.
+    # Parse room metadata — try LiveKit room object first, fall back to Supabase.
     meta = {}
     raw_metadata = room.metadata
-    if not raw_metadata:
-        logger.info("Room metadata empty on join — waiting for propagation...")
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            raw_metadata = room.metadata
-            if raw_metadata:
-                break
-
-    if not raw_metadata:
-        logger.error("Room metadata still empty after 5s — using fallback prompt")
-    else:
+    if raw_metadata:
         try:
             meta = json.loads(raw_metadata)
-            state.call_id = meta.get("callId", "")
-            state.user_id = meta.get("userId", "")
-            state.memory_space_id = meta.get("memorySpaceId", "")
-            state.character_name = meta.get("characterName", "")
-            state.current_relationship_xp = meta.get("relationshipXP", 0)
-            state.current_relationship_level = meta.get("relationshipLevel", 1)
-            state.current_relationship_stage = meta.get("relationshipStage", "Stranger")
-            state.current_mood = meta.get("currentMood", "Neutral")
-            state.metadata = meta
-            logger.info(
-                "Joined room for character=%s, call=%s, level=%d, stage=%s",
-                state.character_name,
-                state.call_id,
-                state.current_relationship_level,
-                state.current_relationship_stage,
-            )
+            logger.info("Metadata loaded from LiveKit room object")
         except json.JSONDecodeError:
             logger.warning("Failed to parse room metadata: %s", raw_metadata[:200])
+
+    # Fallback: fetch metadata from voice_calls table via room name.
+    # LiveKit Agents SDK v1.0 may not populate room.metadata at entrypoint time.
+    if not meta and room.name:
+        logger.info("Room metadata empty — fetching from Supabase by room name: %s", room.name)
+        try:
+            vc = await asyncio.to_thread(
+                lambda: supabase.table("voice_calls")
+                .select("id, user_id, memory_space_id, metadata")
+                .eq("livekit_room_name", room.name)
+                .eq("status", "active")
+                .single()
+                .execute()
+            )
+            if vc.data and vc.data.get("metadata"):
+                meta = vc.data["metadata"]
+                # Ensure callId is set from the record
+                if not meta.get("callId"):
+                    meta["callId"] = vc.data["id"]
+                logger.info("Metadata loaded from Supabase voice_calls record")
+        except Exception:
+            logger.exception("Failed to fetch metadata from Supabase")
+
+    if meta:
+        state.call_id = meta.get("callId", "")
+        state.user_id = meta.get("userId", "")
+        state.memory_space_id = meta.get("memorySpaceId", "")
+        state.character_name = meta.get("characterName", "")
+        state.current_relationship_xp = meta.get("relationshipXP", 0)
+        state.current_relationship_level = meta.get("relationshipLevel", 1)
+        state.current_relationship_stage = meta.get("relationshipStage", "Stranger")
+        state.current_mood = meta.get("currentMood", "Neutral")
+        state.metadata = meta
+        logger.info(
+            "Joined room for character=%s, call=%s, level=%d, stage=%s",
+            state.character_name,
+            state.call_id,
+            state.current_relationship_level,
+            state.current_relationship_stage,
+        )
+    else:
+        logger.error("No metadata from LiveKit or Supabase — using TEST_SYSTEM_PROMPT")
 
     # --- Load character context from Supabase ---
     system_prompt = TEST_SYSTEM_PROMPT
@@ -400,8 +418,6 @@ async def entrypoint(ctx: agents.JobContext):
             )
         except Exception:
             logger.exception("Failed to load character context — using fallback prompt")
-    else:
-        logger.error("No metadata available — agent will use TEST_SYSTEM_PROMPT")
 
     # Resolve voice profile for TTS
     voice_id = ""
@@ -530,16 +546,17 @@ async def entrypoint(ctx: agents.JobContext):
         )
 
         # Schedule post-call archival as a background task.
-        # Store in _background_tasks to prevent GC before completion.
+        # Uses _create_safe_task to prevent GC before completion.
         if state.call_id and state.transcript:
-            task = asyncio.create_task(_run_archival(state, meta, call_duration))
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
+            try:
+                _create_safe_task(_run_archival(state, meta, call_duration))
+            except RuntimeError:
+                logger.error("No running event loop — archival lost for call %s", state.call_id)
 
-    # Start billing loop and inactivity monitor
+    # Start billing loop and inactivity monitor (use _create_safe_task to prevent GC)
     if state.call_id:
-        state.billing_task = asyncio.create_task(billing_loop(state, session, room))
-        state.inactivity_task = asyncio.create_task(inactivity_monitor(state, session, room))
+        state.billing_task = _create_safe_task(billing_loop(state, session, room))
+        state.inactivity_task = _create_safe_task(inactivity_monitor(state, session, room))
 
     # Start the session — framework keeps job alive until room empties
     await session.start(

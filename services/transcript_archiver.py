@@ -85,11 +85,13 @@ async def archive_call(
         filter_field = "customCharacterId" if custom_character_id else "characterId"
         filter_value = custom_character_id if custom_character_id else character_id
 
-        supabase.table("UserCharacter").update({
-            "lastMemorySync": datetime.now(timezone.utc).isoformat(),
-        }).eq("userId", user_id).eq(
-            filter_field, filter_value
-        ).eq("version", 1).execute()
+        await asyncio.to_thread(
+            lambda: supabase.table("UserCharacter").update({
+                "lastMemorySync": datetime.now(timezone.utc).isoformat(),
+            }).eq("userId", user_id).eq(
+                filter_field, filter_value
+            ).eq("version", 1).execute()
+        )
 
         logger.info("Step 1: lastMemorySync locked")
     except Exception:
@@ -138,7 +140,9 @@ async def archive_call(
                 record["embedding"] = embeddings[i]
             records.append(record)
 
-        supabase.table("messages").insert(records).execute()
+        await asyncio.to_thread(
+            lambda: supabase.table("messages").insert(records).execute()
+        )
         logger.info("Step 2: %d turns inserted into messages table", len(records))
 
     except Exception:
@@ -157,30 +161,35 @@ async def archive_call(
         # Fetch token_cost from the voice_calls record
         token_cost = 0
         try:
-            vc = supabase.table("voice_calls").select("token_cost").eq(
-                "id", call_id
-            ).single().execute()
+            vc = await asyncio.to_thread(
+                lambda: supabase.table("voice_calls").select("token_cost").eq(
+                    "id", call_id
+                ).single().execute()
+            )
             if vc.data:
                 token_cost = vc.data.get("token_cost", 0) or 0
         except Exception:
             logger.warning("Could not fetch token_cost for summary card")
 
-        supabase.table("messages").insert({
-            "memory_space_id": memory_space_id,
-            "user_id": user_id,
-            "character_id": character_id,
-            "custom_character_id": custom_character_id,
-            "role": "system",
-            "content": "",
-            "metadata": {
-                "type": "voice_call_summary",
-                "source": "voice_call",
-                "call_id": call_id,
-                "duration": call_duration_seconds,
-                "durationDisplay": duration_display,
-                "tokenCost": token_cost,
-            },
-        }).execute()
+        await asyncio.to_thread(
+            lambda: supabase.table("messages").insert({
+                "memory_space_id": memory_space_id,
+                "user_id": user_id,
+                "character_id": character_id,
+                "custom_character_id": custom_character_id,
+                "role": "system",
+                "content": "",
+                "metadata": {
+                    "type": "voice_call_summary",
+                    "source": "voice_call",
+                    "call_id": call_id,
+                    "duration": call_duration_seconds,
+                    "durationDisplay": duration_display,
+                    "tokenCost": token_cost,
+                    "xpGained": cumulative_xp,
+                },
+            }).execute()
+        )
         logger.info("Step 2b: voice call summary card inserted")
 
     except Exception:
@@ -234,7 +243,9 @@ async def archive_call(
             if summary_embedding:
                 memory_record["embedding"] = summary_embedding
 
-            supabase.table("memories").insert(memory_record).execute()
+            await asyncio.to_thread(
+                lambda: supabase.table("memories").insert(memory_record).execute()
+            )
             logger.info("Step 3: conversation_summary stored (importance=%d)", importance)
 
     except Exception:
@@ -265,11 +276,13 @@ async def archive_call(
         filter_field = "customCharacterId" if custom_character_id else "characterId"
         filter_value = custom_character_id if custom_character_id else character_id
 
-        uc = supabase.table("UserCharacter").select(
-            "total_call_duration, relationshipXP, relationshipLevel"
-        ).eq("userId", user_id).eq(
-            filter_field, filter_value,
-        ).eq("version", 1).single().execute()
+        uc = await asyncio.to_thread(
+            lambda: supabase.table("UserCharacter").select(
+                "total_call_duration, relationshipXP, relationshipLevel"
+            ).eq("userId", user_id).eq(
+                filter_field, filter_value,
+            ).eq("version", 1).single().execute()
+        )
 
         update_data = {
             "currentMood": final_mood,
@@ -289,11 +302,13 @@ async def archive_call(
             update_data["relationshipLevel"] = new_level
             update_data["relationship_stage"] = new_stage
 
-        supabase.table("UserCharacter").update(update_data).eq(
-            "userId", user_id
-        ).eq(
-            filter_field, filter_value,
-        ).eq("version", 1).execute()
+        await asyncio.to_thread(
+            lambda: supabase.table("UserCharacter").update(update_data).eq(
+                "userId", user_id
+            ).eq(
+                filter_field, filter_value,
+            ).eq("version", 1).execute()
+        )
 
     except Exception:
         logger.exception("Failed to update UserCharacter post-call")
@@ -419,9 +434,11 @@ OUTPUT (JSON only):
         # Fetch existing fact keys so we only add NEW facts (no duplicates).
         existing_keys = set()
         try:
-            existing = supabase.table("memories").select("metadata").eq(
-                "memory_space_id", memory_space_id
-            ).eq("memory_type", "user_fact").execute()
+            existing = await asyncio.to_thread(
+                lambda: supabase.table("memories").select("metadata").eq(
+                    "memory_space_id", memory_space_id
+                ).eq("memory_type", "user_fact").execute()
+            )
             for row in (existing.data or []):
                 key = (row.get("metadata") or {}).get("fact_key")
                 if key:
@@ -465,7 +482,9 @@ OUTPUT (JSON only):
             fact_records.append(record)
 
         if fact_records:
-            supabase.table("memories").insert(fact_records).execute()
+            await asyncio.to_thread(
+                lambda: supabase.table("memories").insert(fact_records).execute()
+            )
             logger.info("Stored %d user facts from voice transcript", len(fact_records))
 
     except Exception:

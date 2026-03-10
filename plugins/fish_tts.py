@@ -153,7 +153,7 @@ class FishChunkedStream(tts.ChunkedStream):
                 async for chunk in resp.aiter_bytes():
                     output_emitter.push(chunk)
 
-            output_emitter.flush()
+                output_emitter.flush()
 
 
 def create_fish_tts(voice_id: str | None = None) -> FishTTS:
