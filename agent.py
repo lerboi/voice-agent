@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -545,13 +546,22 @@ async def entrypoint(ctx: agents.JobContext):
             state.cumulative_xp,
         )
 
-        # Schedule post-call archival as a background task.
-        # Uses _create_safe_task to prevent GC before completion.
+        # Run post-call archival in a SEPARATE THREAD with its own event loop.
+        # The LiveKit SDK shuts down the default executor when the session ends,
+        # which kills asyncio.to_thread() calls on the main loop. A fresh loop
+        # in a dedicated thread has its own executor and works reliably.
         if state.call_id and state.transcript:
-            try:
-                _create_safe_task(_run_archival(state, meta, call_duration))
-            except RuntimeError:
-                logger.error("No running event loop — archival lost for call %s", state.call_id)
+            def _archival_thread():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(_run_archival(state, meta, call_duration))
+                except Exception:
+                    logger.exception("Archival thread failed for call %s", state.call_id)
+                finally:
+                    loop.close()
+
+            threading.Thread(target=_archival_thread, daemon=False).start()
 
     # Start billing loop and inactivity monitor (use _create_safe_task to prevent GC)
     if state.call_id:
