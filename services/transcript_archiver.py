@@ -35,10 +35,19 @@ logger = logging.getLogger("anione-voice-agent")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY)
-groq_client = AsyncOpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1",
-)
+
+
+def _create_groq_client() -> AsyncOpenAI:
+    """Create a fresh AsyncOpenAI client for Groq.
+
+    Must NOT be module-level: archive_call runs in a dedicated thread with its
+    own event loop (agent.py on_close), so the httpx client inside AsyncOpenAI
+    must be bound to that loop, not the main agent loop.
+    """
+    return AsyncOpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+    )
 
 
 async def _voyage_embed_with_retry(texts: list[str], max_retries: int = 2) -> list | None:
@@ -426,7 +435,8 @@ Focus on: emotional beats, relationship developments, key facts learned, promise
 Output ONLY the summary paragraph."""
 
     try:
-        response = await groq_client.chat.completions.create(
+        client = _create_groq_client()
+        response = await client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": "You are a concise conversation summarizer."},
@@ -478,7 +488,8 @@ OUTPUT (JSON only):
 {{"facts": [{{"key": "user_name", "value": "Jake", "sentence": "The user's name is Jake."}}]}}"""
 
     try:
-        response = await groq_client.chat.completions.create(
+        client = _create_groq_client()
+        response = await client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": "Extract user facts. Output ONLY valid JSON."},

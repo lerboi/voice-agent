@@ -77,19 +77,12 @@ TEST_SYSTEM_PROMPT = (
     "Prefix each sentence with an emotion tag like (happy) or (excited) to convey tone."
 )
 
-# Regex to strip Fish Speech emotion/tone tags from text before storing in transcript.
-# Matches tags like (happy), (laughing), (soft tone) etc.
-_EMOTION_TAG_RE = re.compile(r"\((?:happy|sad|angry|excited|calm|nervous|confident|surprised|"
-                              r"satisfied|delighted|scared|worried|upset|frustrated|depressed|"
-                              r"empathetic|embarrassed|disgusted|moved|proud|relaxed|grateful|"
-                              r"curious|sarcastic|disdainful|unhappy|anxious|hysterical|"
-                              r"indifferent|uncertain|doubtful|confused|disappointed|regretful|"
-                              r"guilty|ashamed|jealous|envious|hopeful|optimistic|pessimistic|"
-                              r"nostalgic|lonely|bored|contemptuous|sympathetic|compassionate|"
-                              r"determined|resigned|in a hurry tone|shouting|screaming|"
-                              r"whispering|soft tone|laughing|chuckling|sobbing|crying loudly|"
-                              r"sighing|groaning|panting|gasping|yawning|snoring|break|"
-                              r"long-break)\)\s*")
+# Regex to strip Fish Speech S2-Pro [bracket] emotion/tone tags from text before storing
+# in transcript. S2 uses free-form [tag] syntax, so we match any [...] pattern.
+# Parenthesized text is NOT stripped — the prompt forbids (tag) syntax, so any (text)
+# in LLM output is natural speech. The TTS sanitizer in fish_tts.py separately strips
+# (parenthesis) tags before they reach Fish Audio.
+_EMOTION_TAG_RE = re.compile(r"\[[^\]]+\]\s*")
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +505,7 @@ async def entrypoint(ctx: agents.JobContext):
 
         elif item.role == "assistant":
             was_interrupted = getattr(item, "interrupted", False)
-            # Strip Fish Speech emotion tags before storing — TTS has already consumed them
+            # Strip Fish Speech S2-Pro [bracket] tags before storing in transcript
             clean_content = _EMOTION_TAG_RE.sub("", content).strip() or content
             state.transcript.append(
                 TranscriptTurn(

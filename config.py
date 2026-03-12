@@ -21,6 +21,7 @@ FISH_SPEECH_API_URL = os.environ.get(
     "FISH_SPEECH_API_URL", "https://api.fish.audio"
 )
 FISH_SPEECH_VOICE_ID = os.getenv("FISH_SPEECH_VOICE_ID", "")
+FISH_SPEECH_MODEL = os.getenv("FISH_SPEECH_MODEL", "s2-pro")
 
 # Next.js API (for billing)
 NEXTJS_API_URL = os.environ.get("NEXTJS_API_URL", "http://localhost:3000")

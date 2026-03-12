@@ -5,6 +5,9 @@ The livekit-plugins-openai TTS wrapper cannot be used because Fish Audio
 does NOT have an OpenAI-compatible /v1/audio/speech endpoint. This plugin
 implements livekit.agents.tts.TTS directly with httpx.
 
+Targets Fish Audio S2-Pro model with [bracket] emotion tags.
+Set FISH_SPEECH_MODEL=s1 in env to fall back to S1 if needed.
+
 Supports dynamic voice profiles per character:
   - voice_profile_id: Fish Speech reference_id (for pre-built voices)
   - voice_reference_url: Custom reference audio URL (for voice cloning)
@@ -18,10 +21,11 @@ import re
 from dataclasses import dataclass, replace
 
 import httpx
+import ormsgpack
 from livekit.agents import tts
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions
 
-from config import FISH_SPEECH_API_KEY, FISH_SPEECH_API_URL, FISH_SPEECH_VOICE_ID
+from config import FISH_SPEECH_API_KEY, FISH_SPEECH_API_URL, FISH_SPEECH_MODEL, FISH_SPEECH_VOICE_ID
 
 logger = logging.getLogger("anione-voice-agent")
 
@@ -29,55 +33,28 @@ SAMPLE_RATE = 44100
 NUM_CHANNELS = 1
 MAX_TTS_RETRIES = 2  # Total attempts = MAX_TTS_RETRIES + 1
 
-# Fish Speech S1 recognized emotion/tone tags.
-# Tags NOT in this set will be stripped before sending to TTS to prevent
-# the model from reading them aloud (e.g. "(smirking)" → spoken as "smirking").
-_VALID_FISH_TAGS = frozenset({
-    # Emotions
-    "happy", "sad", "angry", "excited", "calm", "nervous", "confident",
-    "surprised", "satisfied", "delighted", "scared", "worried", "upset",
-    "frustrated", "depressed", "empathetic", "embarrassed", "disgusted",
-    "moved", "proud", "relaxed", "grateful", "curious", "sarcastic",
-    "disdainful", "unhappy", "anxious", "hysterical", "indifferent",
-    "uncertain", "doubtful", "confused", "disappointed", "regretful",
-    "guilty", "ashamed", "jealous", "envious", "hopeful", "optimistic",
-    "pessimistic", "nostalgic", "lonely", "bored", "contemptuous",
-    "sympathetic", "compassionate", "determined", "resigned",
-    # Tone/effects
-    "in a hurry tone", "shouting", "screaming", "whispering", "soft tone",
-    "laughing", "chuckling", "sobbing", "crying loudly", "sighing",
-    "groaning", "panting", "gasping", "yawning", "snoring",
-    # Pauses
-    "break", "long-break",
-})
-
-# Regex to match (tag) patterns — captures the tag content
-_TAG_RE = re.compile(r"\(([^)]+)\)")
-
 # Regex to match *action* patterns (roleplay actions the LLM shouldn't output in voice mode)
 _ASTERISK_ACTION_RE = re.compile(r"\*[^*]+\*")
+
+# Regex to match (parenthesis) tags — S2-Pro does NOT support these, so they must
+# be stripped to prevent being read aloud. S1 used (tag) syntax; S2-Pro uses [tag].
+_PAREN_TAG_RE = re.compile(r"\([^)]+\)")
 
 
 def _sanitize_tts_input(text: str) -> str:
     """
-    Clean text before sending to Fish Speech TTS.
+    Clean text before sending to Fish Speech TTS (S2-Pro).
 
     1. Strip *action* text (e.g. *smirks*, *blushes*)
-    2. Strip (tag) where tag is NOT in Fish Speech's recognized set
-       (e.g. (smirking), (blushing), (teasing) get removed)
-    3. Valid Fish Speech tags like (happy), (laughing) are preserved
+    2. Strip (parenthesis) tags — S2-Pro doesn't support S1's (tag) syntax
+       and would read them aloud as literal text
+    3. [bracket] tags are left intact — S2-Pro handles them natively
     """
     # Step 1: Remove *action* patterns
     text = _ASTERISK_ACTION_RE.sub("", text)
 
-    # Step 2: Remove invalid emotion tags, keep valid ones
-    def _replace_tag(match: re.Match) -> str:
-        tag_content = match.group(1).strip().lower()
-        if tag_content in _VALID_FISH_TAGS:
-            return match.group(0)  # Keep valid tag as-is
-        return ""  # Strip invalid tag
-
-    text = _TAG_RE.sub(_replace_tag, text)
+    # Step 2: Remove (parenthesis) tags — S2-Pro only supports [bracket] tags
+    text = _PAREN_TAG_RE.sub("", text)
 
     # Clean up extra whitespace from removals
     text = re.sub(r"  +", " ", text).strip()
@@ -92,11 +69,11 @@ VOICE_ARCHETYPES = {
     "dandere_female":   "",
     "onee_san_female":  "",
     "yandere_female":   "",
-    "default_female":   "",
+    "default_female":   "8ef4a238714b45718ce04243307c57a7",
     "shonen_male":      "",
     "cool_male":        "",
     "gentle_male":      "",
-    "default_male":     "",
+    "default_male":     "b995b5485455416fa18b34ec683188ca",
 }
 
 
@@ -136,10 +113,11 @@ def get_archetype_voice_id(gender: str | None, personality: str | None) -> str:
 class _FishTTSOptions:
     reference_id: str
     format: str
+    model: str
 
 
 class FishTTS(tts.TTS):
-    """Fish Audio TTS using native /v1/tts endpoint."""
+    """Fish Audio TTS using native /v1/tts endpoint (S2-Pro)."""
 
     def __init__(
         self,
@@ -147,6 +125,7 @@ class FishTTS(tts.TTS):
         api_key: str = "",
         base_url: str = "",
         reference_id: str = "",
+        model: str = "",
         response_format: str = "mp3",
     ) -> None:
         super().__init__(
@@ -159,6 +138,7 @@ class FishTTS(tts.TTS):
         self._opts = _FishTTSOptions(
             reference_id=reference_id or FISH_SPEECH_VOICE_ID or "",
             format=response_format,
+            model=model or FISH_SPEECH_MODEL or "s2-pro",
         )
 
     def update_options(self, *, reference_id: str | None = None) -> None:
@@ -184,10 +164,12 @@ class FishChunkedStream(tts.ChunkedStream):
         url = f"{self._tts._base_url}/v1/tts"
         headers = {
             "Authorization": f"Bearer {self._tts._api_key}",
-            "Content-Type": "application/json",
+            "Content-Type": "application/msgpack",
+            "model": self._opts.model,
         }
 
-        # Sanitize text: strip invalid emotion tags and *actions* before TTS
+        # Sanitize text: strip (parenthesis) tags and *actions* before TTS
+        # [bracket] tags are passed through — S2-Pro handles them natively
         clean_text = _sanitize_tts_input(self.input_text)
         if not clean_text:
             # Nothing left after sanitization — skip TTS
@@ -207,7 +189,10 @@ class FishChunkedStream(tts.ChunkedStream):
                 async with httpx.AsyncClient(
                     timeout=httpx.Timeout(30, connect=self._conn_options.timeout),
                 ) as client:
-                    async with client.stream("POST", url, headers=headers, json=body) as resp:
+                    async with client.stream(
+                        "POST", url, headers=headers,
+                        content=ormsgpack.packb(body),
+                    ) as resp:
                         if resp.status_code != 200:
                             error_body = await resp.aread()
                             raise Exception(
@@ -247,7 +232,7 @@ class FishChunkedStream(tts.ChunkedStream):
 
 def create_fish_tts(voice_id: str | None = None) -> FishTTS:
     """
-    Create a Fish Audio TTS instance.
+    Create a Fish Audio TTS instance (S2-Pro).
 
     Args:
         voice_id: Fish Audio reference_id for the voice to use.
@@ -257,4 +242,5 @@ def create_fish_tts(voice_id: str | None = None) -> FishTTS:
         api_key=FISH_SPEECH_API_KEY,
         base_url=FISH_SPEECH_API_URL,
         reference_id=voice_id or FISH_SPEECH_VOICE_ID or "",
+        model=FISH_SPEECH_MODEL,
     )
