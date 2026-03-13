@@ -33,7 +33,7 @@ from config import (
 from plugins.groq_llm import create_groq_llm
 from plugins.fish_tts import create_fish_tts, get_archetype_voice_id
 from services.context_loader import (
-    load_character_context_sync,
+    load_character_context,
     build_voice_system_prompt,
     get_behavior_tier,
     supabase,
@@ -401,7 +401,7 @@ async def entrypoint(ctx: agents.JobContext):
     nsfw_enabled = False
     if meta:
         try:
-            char_ctx = await asyncio.to_thread(load_character_context_sync, meta)
+            char_ctx = await load_character_context(meta)
             nsfw_enabled = meta.get("nsfwEnabled", False)
             system_prompt = build_voice_system_prompt(char_ctx, nsfw_enabled)
             state.character_name = char_ctx.character_name or state.character_name

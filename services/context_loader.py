@@ -8,6 +8,7 @@ Replicates the same queries as:
   - behaviorGuidelines.js (getBehaviorTier)
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from supabase import create_client
@@ -109,7 +110,7 @@ class CharacterContext:
     persona_personality: str = ""     # For archetype selection fallback
 
 
-def load_character_context_sync(metadata: dict) -> CharacterContext:
+async def load_character_context(metadata: dict) -> CharacterContext:
     """
     Fetch character persona + relationship + memories from Supabase.
 
@@ -141,95 +142,103 @@ def load_character_context_sync(metadata: dict) -> CharacterContext:
         tier = get_behavior_tier(ctx.relationship_level)
         ctx.behavior_prompt = tier["prompt"]
 
-    # --- Fetch persona (aiDescription) ---
-    # The agent fetches this directly because it can be 2-5KB
-    # and is NOT included in room metadata.
-    try:
-        if is_custom and custom_character_id:
-            # CustomCharacter -> CustomPersona via persona_id
-            cc = supabase.table("CustomCharacter").select(
-                "id, name, animename, is_sandbox, "
-                "CustomPersona:persona_id(ai_description, voice_profile_id, voice_reference_url, gender, personality)"
-            ).eq("id", custom_character_id).single().execute()
+    # --- All queries defined as sync closures, run in parallel via asyncio.gather ---
 
-            if cc.data:
-                ctx.character_name = cc.data.get("name", ctx.character_name)
-                ctx.anime_name = cc.data.get("animename", "Original")
-                ctx.is_sandbox = cc.data.get("is_sandbox", False)
-                persona = cc.data.get("CustomPersona") or {}
-                ctx.persona_description = persona.get("ai_description", "")
-                ctx.voice_profile_id = persona.get("voice_profile_id", "") or ""
-                ctx.voice_reference_url = persona.get("voice_reference_url", "") or ""
-                ctx.persona_gender = persona.get("gender", "") or ""
-                ctx.persona_personality = persona.get("personality", "") or ""
-        elif character_id:
-            # Character -> Persona via personaId
-            ch = supabase.table("Character").select(
-                'id, name, animename, '
-                'Persona:personaId("aiDescription", voice_profile_id, gender, personality)'
-            ).eq("id", int(character_id)).single().execute()
+    def _fetch_persona():
+        try:
+            if is_custom and custom_character_id:
+                cc = supabase.table("CustomCharacter").select(
+                    "id, name, animename, is_sandbox, "
+                    "CustomPersona:persona_id(ai_description, voice_profile_id, voice_reference_url, gender, personality)"
+                ).eq("id", custom_character_id).single().execute()
+                if cc.data:
+                    ctx.character_name = cc.data.get("name", ctx.character_name)
+                    ctx.anime_name = cc.data.get("animename", "Original")
+                    ctx.is_sandbox = cc.data.get("is_sandbox", False)
+                    persona = cc.data.get("CustomPersona") or {}
+                    ctx.persona_description = persona.get("ai_description", "")
+                    ctx.voice_profile_id = persona.get("voice_profile_id", "") or ""
+                    ctx.voice_reference_url = persona.get("voice_reference_url", "") or ""
+                    ctx.persona_gender = persona.get("gender", "") or ""
+                    ctx.persona_personality = persona.get("personality", "") or ""
+            elif character_id:
+                ch = supabase.table("Character").select(
+                    'id, name, animename, '
+                    'Persona:personaId("aiDescription", voice_profile_id, gender, personality)'
+                ).eq("id", int(character_id)).single().execute()
+                if ch.data:
+                    ctx.character_name = ch.data.get("name", ctx.character_name)
+                    ctx.anime_name = ch.data.get("animename", "")
+                    persona = ch.data.get("Persona") or {}
+                    ctx.persona_description = persona.get("aiDescription", "")
+                    ctx.voice_profile_id = persona.get("voice_profile_id", "") or ""
+                    ctx.persona_gender = persona.get("gender", "") or ""
+                    ctx.persona_personality = persona.get("personality", "") or ""
+        except Exception:
+            logger.exception("Failed to fetch persona from Supabase")
 
-            if ch.data:
-                ctx.character_name = ch.data.get("name", ctx.character_name)
-                ctx.anime_name = ch.data.get("animename", "")
-                persona = ch.data.get("Persona") or {}
-                ctx.persona_description = persona.get("aiDescription", "")
-                ctx.voice_profile_id = persona.get("voice_profile_id", "") or ""
-                ctx.persona_gender = persona.get("gender", "") or ""
-                ctx.persona_personality = persona.get("personality", "") or ""
-    except Exception:
-        logger.exception("Failed to fetch persona from Supabase")
+    def _fetch_scenario():
+        try:
+            sc = supabase.table("memories").select("content").eq(
+                "memory_space_id", memory_space_id
+            ).eq("memory_type", "scenario_context").order(
+                "created_at", desc=True
+            ).limit(1).execute()
+            if sc.data:
+                return sc.data[0]["content"]
+        except Exception:
+            logger.warning("Failed to fetch scenario_context")
+        return ""
 
-    # --- Fetch memory context ---
-    # 1. scenario_context (always included, importance=10)
-    try:
-        sc = supabase.table("memories").select("content").eq(
-            "memory_space_id", memory_space_id
-        ).eq("memory_type", "scenario_context").order(
-            "created_at", desc=True
-        ).limit(1).execute()
+    def _fetch_summaries():
+        try:
+            ms = supabase.table("memories").select("content, created_at").eq(
+                "memory_space_id", memory_space_id
+            ).eq("memory_type", "conversation_summary").order(
+                "created_at", desc=True
+            ).limit(3).execute()
+            return [m["content"] for m in (ms.data or [])]
+        except Exception:
+            logger.warning("Failed to fetch conversation summaries")
+        return []
 
-        if sc.data:
-            ctx.scenario_context = sc.data[0]["content"]
-    except Exception:
-        logger.warning("Failed to fetch scenario_context")
+    def _fetch_facts():
+        try:
+            uf = supabase.table("memories").select("content").eq(
+                "memory_space_id", memory_space_id
+            ).eq("memory_type", "user_fact").order(
+                "created_at", desc=True
+            ).limit(10).execute()
+            return [m["content"] for m in (uf.data or [])]
+        except Exception:
+            logger.warning("Failed to fetch user facts")
+        return []
 
-    # 2. conversation_summary (top 3 most recent)
-    try:
-        ms = supabase.table("memories").select("content, created_at").eq(
-            "memory_space_id", memory_space_id
-        ).eq("memory_type", "conversation_summary").order(
-            "created_at", desc=True
-        ).limit(3).execute()
+    def _fetch_messages():
+        try:
+            rm = supabase.table("messages").select("role, content, metadata").eq(
+                "memory_space_id", memory_space_id
+            ).in_("role", ["user", "assistant"]).order(
+                "created_at", desc=True
+            ).limit(5).execute()
+            return list(reversed(rm.data or []))
+        except Exception:
+            logger.warning("Failed to fetch recent messages")
+        return []
 
-        ctx.memory_summaries = [m["content"] for m in (ms.data or [])]
-    except Exception:
-        logger.warning("Failed to fetch conversation summaries")
+    # Run all 5 queries in parallel (each in its own thread)
+    _, scenario, summaries, facts, messages = await asyncio.gather(
+        asyncio.to_thread(_fetch_persona),
+        asyncio.to_thread(_fetch_scenario),
+        asyncio.to_thread(_fetch_summaries),
+        asyncio.to_thread(_fetch_facts),
+        asyncio.to_thread(_fetch_messages),
+    )
 
-    # 3. user_fact (all, up to 10)
-    try:
-        uf = supabase.table("memories").select("content").eq(
-            "memory_space_id", memory_space_id
-        ).eq("memory_type", "user_fact").order(
-            "created_at", desc=True
-        ).limit(10).execute()
-
-        ctx.user_facts = [m["content"] for m in (uf.data or [])]
-    except Exception:
-        logger.warning("Failed to fetch user facts")
-
-    # 4. Recent messages (last 5 for voice context — smaller than text chat's budget)
-    try:
-        rm = supabase.table("messages").select("role, content, metadata").eq(
-            "memory_space_id", memory_space_id
-        ).in_("role", ["user", "assistant"]).order(
-            "created_at", desc=True
-        ).limit(5).execute()
-
-        # Reverse to chronological order
-        ctx.recent_messages = list(reversed(rm.data or []))
-    except Exception:
-        logger.warning("Failed to fetch recent messages")
+    ctx.scenario_context = scenario
+    ctx.memory_summaries = summaries
+    ctx.user_facts = facts
+    ctx.recent_messages = messages
 
     logger.info(
         "Context loaded: persona=%d chars, summaries=%d, facts=%d, recent=%d",

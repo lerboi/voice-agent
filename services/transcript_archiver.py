@@ -207,51 +207,10 @@ async def archive_call(
         critical_failure = True
 
     # ---------------------------------------------------------------
-    # STEP 2b: Insert voice call summary card into messages table
-    # This is a role='system' message that ChatWindow renders as a
-    # VoiceCallSummaryCard. It persists across page refreshes.
+    # STEP 2b: Voice call summary card
+    # Skipped — inserted by endCallAPI on the Next.js side to
+    # guarantee persistence regardless of agent lifecycle.
     # ---------------------------------------------------------------
-    try:
-        mins = call_duration_seconds // 60
-        secs = call_duration_seconds % 60
-        duration_display = f"{mins:02d}:{secs:02d}"
-
-        # Fetch token_cost from the voice_calls record
-        token_cost = 0
-        try:
-            vc = await asyncio.to_thread(
-                lambda: supabase.table("voice_calls").select("token_cost").eq(
-                    "id", call_id
-                ).single().execute()
-            )
-            if vc.data:
-                token_cost = vc.data.get("token_cost", 0) or 0
-        except Exception:
-            logger.warning("Could not fetch token_cost for summary card")
-
-        await asyncio.to_thread(
-            lambda: supabase.table("messages").insert({
-                "memory_space_id": memory_space_id,
-                "user_id": user_id,
-                "character_id": character_id,
-                "custom_character_id": custom_character_id,
-                "role": "system",
-                "content": "",
-                "metadata": {
-                    "type": "voice_call_summary",
-                    "source": "voice_call",
-                    "call_id": call_id,
-                    "duration": call_duration_seconds,
-                    "durationDisplay": duration_display,
-                    "tokenCost": token_cost,
-                    "xpGained": cumulative_xp,
-                },
-            }).execute()
-        )
-        logger.info("Step 2b: voice call summary card inserted")
-
-    except Exception:
-        logger.exception("Failed to insert voice call summary card (non-blocking)")
 
     # ---------------------------------------------------------------
     # STEP 3: Generate voice call summary -> conversation_summary
