@@ -15,6 +15,7 @@ import logging
 import re
 
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
 import httpx
@@ -530,12 +531,56 @@ async def entrypoint(ctx: agents.JobContext):
         if state.inactivity_task and not state.inactivity_task.done():
             state.inactivity_task.cancel()
 
+        call_duration = int(time.time() - state.call_start_time)
         logger.info(
-            "Call ended: call=%s, turns=%d, xp_earned=%d",
+            "Call ended: call=%s, turns=%d, duration=%ds, xp_earned=%d",
             state.call_id,
             len(state.transcript),
+            call_duration,
             state.cumulative_xp,
         )
+
+        # Final synchronous checkpoint: write ALL remaining turns to voice_call_turns.
+        # This MUST complete before the process exits. The full archival (embeddings,
+        # summary, facts) is handled by the Next.js archiveCallAPI endpoint, which
+        # reads from voice_call_turns. This sync insert (~200-500ms) ensures no
+        # transcript data is lost when the LiveKit dispatch worker kills the process.
+        if state.call_id and state.transcript:
+            remaining = state.transcript[state.last_checkpoint_index:]
+            if remaining:
+                try:
+                    records = []
+                    for i, turn in enumerate(remaining):
+                        records.append({
+                            "call_id": state.call_id,
+                            "memory_space_id": state.memory_space_id,
+                            "turn_index": state.last_checkpoint_index + i,
+                            "role": turn.role,
+                            "content": turn.content,
+                            "was_interrupted": turn.was_interrupted,
+                            "metadata": {},
+                        })
+                    supabase.table("voice_call_turns").insert(records).execute()
+                    logger.info(
+                        "Final checkpoint: %d remaining turns saved for call %s",
+                        len(records), state.call_id,
+                    )
+                except Exception:
+                    logger.exception("Final checkpoint failed for call %s", state.call_id)
+
+            # Store shadow summary and cumulative XP in voice_calls metadata
+            # so archiveCallAPI can read them without needing agent state.
+            try:
+                existing_meta = meta.copy() if meta else {}
+                existing_meta["shadowSummary"] = state.shadow_summary
+                existing_meta["cumulative_xp"] = state.cumulative_xp
+                existing_meta["final_mood"] = state.current_mood
+                supabase.table("voice_calls").update(
+                    {"metadata": existing_meta}
+                ).eq("id", state.call_id).execute()
+                logger.info("Stored shadow summary and XP in voice_calls metadata")
+            except Exception:
+                logger.exception("Failed to store metadata for call %s", state.call_id)
 
     # Start billing loop and inactivity monitor (use _create_safe_task to prevent GC)
     if state.call_id:
@@ -548,14 +593,16 @@ async def entrypoint(ctx: agents.JobContext):
         agent=character_agent,
     )
 
-    # Post-call archival — runs after session closes but before entrypoint returns.
-    # Must be here (not in on_close) because the LiveKit dispatch worker exits the
-    # process once the entrypoint function returns. A background thread spawned from
-    # on_close gets killed before completing. Awaiting here keeps the process alive.
+    # Best-effort archival — runs if the SDK doesn't kill the process first.
+    # The guaranteed path is: on_close saves to voice_call_turns → client
+    # triggers archiveCallAPI on the Next.js side.
     call_duration = int(time.time() - state.call_start_time)
-    logger.info("Session closed, starting archival (duration=%ds)", call_duration)
+    logger.info("Session closed (duration=%ds)", call_duration)
     if state.call_id and state.transcript:
-        await _run_archival(state, meta, call_duration)
+        try:
+            await _run_archival(state, meta, call_duration)
+        except Exception:
+            logger.info("Best-effort archival did not complete — client will trigger archiveCallAPI")
 
 
 # ---------------------------------------------------------------------------
