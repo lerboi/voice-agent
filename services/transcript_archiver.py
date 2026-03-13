@@ -40,9 +40,8 @@ voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY)
 def _create_groq_client() -> AsyncOpenAI:
     """Create a fresh AsyncOpenAI client for Groq.
 
-    Must NOT be module-level: archive_call runs in a dedicated thread with its
-    own event loop (agent.py on_close), so the httpx client inside AsyncOpenAI
-    must be bound to that loop, not the main agent loop.
+    Created per-call rather than module-level to ensure the httpx client binds
+    to the current event loop (archival runs after session.start() returns).
     """
     return AsyncOpenAI(
         api_key=GROQ_API_KEY,

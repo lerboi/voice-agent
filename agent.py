@@ -13,7 +13,7 @@ import asyncio
 import json
 import logging
 import re
-import threading
+
 import time
 from dataclasses import dataclass, field
 
@@ -308,10 +308,10 @@ async def maybe_checkpoint_turns(state: CallState):
 
 
 # ---------------------------------------------------------------------------
-# Post-call archival helper (runs as background task from sync on_close)
+# Post-call archival helper (awaited after session.start() returns)
 # ---------------------------------------------------------------------------
 async def _run_archival(state: CallState, meta: dict, call_duration: int):
-    """Run archive_call in a background task since on_close must be sync."""
+    """Run archive_call after the session closes, before the entrypoint returns."""
     try:
         await archive_call(
             call_id=state.call_id,
@@ -530,31 +530,12 @@ async def entrypoint(ctx: agents.JobContext):
         if state.inactivity_task and not state.inactivity_task.done():
             state.inactivity_task.cancel()
 
-        call_duration = int(time.time() - state.call_start_time)
         logger.info(
-            "Call ended: call=%s, turns=%d, duration=%ds, xp_earned=%d",
+            "Call ended: call=%s, turns=%d, xp_earned=%d",
             state.call_id,
             len(state.transcript),
-            call_duration,
             state.cumulative_xp,
         )
-
-        # Run post-call archival in a SEPARATE THREAD with its own event loop.
-        # The LiveKit SDK shuts down the default executor when the session ends,
-        # which kills asyncio.to_thread() calls on the main loop. A fresh loop
-        # in a dedicated thread has its own executor and works reliably.
-        if state.call_id and state.transcript:
-            def _archival_thread():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(_run_archival(state, meta, call_duration))
-                except Exception:
-                    logger.exception("Archival thread failed for call %s", state.call_id)
-                finally:
-                    loop.close()
-
-            threading.Thread(target=_archival_thread, daemon=False).start()
 
     # Start billing loop and inactivity monitor (use _create_safe_task to prevent GC)
     if state.call_id:
@@ -566,6 +547,15 @@ async def entrypoint(ctx: agents.JobContext):
         room=ctx.room,
         agent=character_agent,
     )
+
+    # Post-call archival — runs after session closes but before entrypoint returns.
+    # Must be here (not in on_close) because the LiveKit dispatch worker exits the
+    # process once the entrypoint function returns. A background thread spawned from
+    # on_close gets killed before completing. Awaiting here keeps the process alive.
+    call_duration = int(time.time() - state.call_start_time)
+    logger.info("Session closed, starting archival (duration=%ds)", call_duration)
+    if state.call_id and state.transcript:
+        await _run_archival(state, meta, call_duration)
 
 
 # ---------------------------------------------------------------------------
