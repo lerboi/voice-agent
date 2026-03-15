@@ -29,6 +29,7 @@ def _create_groq_client() -> AsyncOpenAI:
     )
 
 SUMMARIZATION_PROMPT = """Condense the following conversation into a 200-word summary.
+Summarize in the same language the conversation is primarily conducted in.
 Preserve: emotional beats, relationship developments, key facts learned,
 promises made, and any narrative progression.
 

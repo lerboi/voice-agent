@@ -174,9 +174,9 @@ async def billing_loop(state: CallState, session: AgentSession, room: rtc.Room):
                         remaining,
                     )
 
-                    if remaining == 1:
+                    if remaining <= 1:
                         await send_data_message(room, "minutes_warning", {
-                            "remainingMinutes": 1,
+                            "remainingMinutes": remaining,
                         })
 
             except Exception:
@@ -409,7 +409,7 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Create AgentSession with pipeline components
     session = AgentSession(
-        stt=deepgram.STT(),
+        stt=deepgram.STT(language="multi"),
         llm=create_groq_llm(),
         tts=create_fish_tts(voice_id=voice_id or None),
         vad=silero.VAD.load(),
