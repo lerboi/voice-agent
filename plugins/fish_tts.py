@@ -140,6 +140,7 @@ class FishTTS(tts.TTS):
             format=response_format,
             model=model or FISH_SPEECH_MODEL or "s2-pro",
         )
+        self._client = httpx.AsyncClient()
 
     def update_options(self, *, reference_id: str | None = None) -> None:
         if reference_id is not None:
@@ -151,7 +152,7 @@ class FishTTS(tts.TTS):
         return FishChunkedStream(tts=self, input_text=text, conn_options=conn_options)
 
     async def aclose(self) -> None:
-        pass
+        await self._client.aclose()
 
 
 class FishChunkedStream(tts.ChunkedStream):
@@ -186,32 +187,30 @@ class FishChunkedStream(tts.ChunkedStream):
         streaming_started = False
         for attempt in range(MAX_TTS_RETRIES + 1):
             try:
-                async with httpx.AsyncClient(
+                async with self._tts._client.stream(
+                    "POST", url, headers=headers,
+                    content=ormsgpack.packb(body),
                     timeout=httpx.Timeout(30, connect=self._conn_options.timeout),
-                ) as client:
-                    async with client.stream(
-                        "POST", url, headers=headers,
-                        content=ormsgpack.packb(body),
-                    ) as resp:
-                        if resp.status_code != 200:
-                            error_body = await resp.aread()
-                            raise Exception(
-                                f"Fish Audio TTS error {resp.status_code}: {error_body.decode()}"
-                            )
-
-                        output_emitter.initialize(
-                            request_id=resp.headers.get("x-request-id", ""),
-                            sample_rate=SAMPLE_RATE,
-                            num_channels=NUM_CHANNELS,
-                            mime_type=f"audio/{self._opts.format}",
+                ) as resp:
+                    if resp.status_code != 200:
+                        error_body = await resp.aread()
+                        raise Exception(
+                            f"Fish Audio TTS error {resp.status_code}: {error_body.decode()}"
                         )
-                        streaming_started = True
 
-                        async for chunk in resp.aiter_bytes():
-                            output_emitter.push(chunk)
+                    output_emitter.initialize(
+                        request_id=resp.headers.get("x-request-id", ""),
+                        sample_rate=SAMPLE_RATE,
+                        num_channels=NUM_CHANNELS,
+                        mime_type=f"audio/{self._opts.format}",
+                    )
+                    streaming_started = True
 
-                        output_emitter.flush()
-                        return  # Success — exit retry loop
+                    async for chunk in resp.aiter_bytes():
+                        output_emitter.push(chunk)
+
+                    output_emitter.flush()
+                    return  # Success — exit retry loop
 
             except Exception as exc:
                 last_error = exc

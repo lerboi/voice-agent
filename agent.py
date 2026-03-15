@@ -40,7 +40,6 @@ from services.context_loader import (
     supabase,
 )
 from services.shadow_summarizer import generate_shadow_summary
-from services.transcript_archiver import archive_call
 from services.xp_tracker import (
     calculate_xp_delta,
     check_stage_change,
@@ -309,29 +308,6 @@ async def maybe_checkpoint_turns(state: CallState):
 
 
 # ---------------------------------------------------------------------------
-# Post-call archival helper (awaited after session.start() returns)
-# ---------------------------------------------------------------------------
-async def _run_archival(state: CallState, meta: dict, call_duration: int):
-    """Run archive_call after the session closes, before the entrypoint returns."""
-    try:
-        await archive_call(
-            call_id=state.call_id,
-            user_id=state.user_id,
-            character_id=meta.get("characterId"),
-            custom_character_id=meta.get("customCharacterId"),
-            memory_space_id=state.memory_space_id,
-            transcript=state.transcript,
-            shadow_summary=state.shadow_summary,
-            character_name=state.character_name,
-            cumulative_xp=state.cumulative_xp,
-            final_mood=state.current_mood,
-            call_duration_seconds=call_duration,
-        )
-    except Exception:
-        logger.exception("Post-call archival failed for call %s", state.call_id)
-
-
-# ---------------------------------------------------------------------------
 # Server and session lifecycle
 # ---------------------------------------------------------------------------
 server = AgentServer()
@@ -593,16 +569,10 @@ async def entrypoint(ctx: agents.JobContext):
         agent=character_agent,
     )
 
-    # Best-effort archival — runs if the SDK doesn't kill the process first.
-    # The guaranteed path is: on_close saves to voice_call_turns → client
-    # triggers archiveCallAPI on the Next.js side.
+    # Archival is handled by the client-triggered archiveCallAPI endpoint.
+    # on_close already saved all turns to voice_call_turns + metadata to voice_calls.
     call_duration = int(time.time() - state.call_start_time)
     logger.info("Session closed (duration=%ds)", call_duration)
-    if state.call_id and state.transcript:
-        try:
-            await _run_archival(state, meta, call_duration)
-        except Exception:
-            logger.info("Best-effort archival did not complete — client will trigger archiveCallAPI")
 
 
 # ---------------------------------------------------------------------------

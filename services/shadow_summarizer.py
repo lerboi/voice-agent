@@ -16,10 +16,17 @@ from config import GROQ_API_KEY, GROQ_MODEL
 
 logger = logging.getLogger("anione-voice-agent")
 
-groq_client = AsyncOpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1",
-)
+
+def _create_groq_client() -> AsyncOpenAI:
+    """Create a fresh AsyncOpenAI client for Groq.
+
+    Created per-call rather than module-level to ensure the httpx client
+    binds to the current event loop (matches transcript_archiver.py pattern).
+    """
+    return AsyncOpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+    )
 
 SUMMARIZATION_PROMPT = """Condense the following conversation into a 200-word summary.
 Preserve: emotional beats, relationship developments, key facts learned,
@@ -62,7 +69,8 @@ async def generate_shadow_summary(
     )
 
     try:
-        response = await groq_client.chat.completions.create(
+        client = _create_groq_client()
+        response = await client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": "You are a concise conversation summarizer."},
