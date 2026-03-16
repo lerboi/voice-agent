@@ -163,6 +163,17 @@ async def billing_loop(state: CallState, session: AgentSession, room: rtc.Room):
                     continue
 
                 if resp.status_code == 400:
+                    error_msg = data.get("error", "")
+
+                    # Call already ended (endCallAPI set status to 'ended') — exit silently
+                    if "not active" in error_msg.lower():
+                        logger.info(
+                            "Call %s no longer active — billing loop exiting",
+                            state.call_id,
+                        )
+                        return
+
+                    # Actually out of voice minutes — notify user and close
                     logger.warning(
                         "Voice minutes exhausted for call %s — shutting down",
                         state.call_id,
@@ -182,6 +193,11 @@ async def billing_loop(state: CallState, session: AgentSession, room: rtc.Room):
                         state.call_id,
                         remaining,
                     )
+
+                    # Send updated balance to frontend on every tick
+                    await send_data_message(room, "minutes_update", {
+                        "remainingMinutes": remaining,
+                    })
 
                     if remaining <= 1:
                         await send_data_message(room, "minutes_warning", {
