@@ -151,7 +151,16 @@ async def billing_loop(state: CallState, session: AgentSession, room: rtc.Room):
                     json={"callId": state.call_id, "minutesUsed": 1},
                     headers={"Authorization": f"Bearer {VOICE_AGENT_API_KEY}"},
                 )
-                data = resp.json()
+
+                try:
+                    data = resp.json()
+                except Exception:
+                    logger.warning(
+                        "Billing API non-JSON response for call %s (status %d, body=%s)",
+                        state.call_id, resp.status_code, resp.text[:200],
+                    )
+                    await asyncio.sleep(BILLING_INTERVAL_SECONDS)
+                    continue
 
                 if resp.status_code == 400:
                     logger.warning(
