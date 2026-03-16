@@ -414,7 +414,7 @@ async def entrypoint(ctx: agents.JobContext):
         tts=create_fish_tts(voice_id=voice_id or None),
         vad=silero.VAD.load(),
         allow_interruptions=True,
-        min_endpointing_delay=0.5,
+        min_endpointing_delay=0.3,
     )
 
     # --- Transcript tracking via conversation_item_added ---
@@ -567,6 +567,11 @@ async def entrypoint(ctx: agents.JobContext):
     await session.start(
         room=ctx.room,
         agent=character_agent,
+    )
+
+    # Character speaks first with a contextual greeting
+    session.generate_reply(
+        instructions="Greet the user with a short, warm, in-character greeting (1 sentence). React to your current mood and relationship stage naturally.",
     )
 
     # Archival is handled by the client-triggered archiveCallAPI endpoint.

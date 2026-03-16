@@ -29,7 +29,7 @@ from config import FISH_SPEECH_API_KEY, FISH_SPEECH_API_URL, FISH_SPEECH_MODEL, 
 
 logger = logging.getLogger("anione-voice-agent")
 
-SAMPLE_RATE = 44100
+SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
 MAX_TTS_RETRIES = 2  # Total attempts = MAX_TTS_RETRIES + 1
 
@@ -126,7 +126,7 @@ class FishTTS(tts.TTS):
         base_url: str = "",
         reference_id: str = "",
         model: str = "",
-        response_format: str = "mp3",
+        response_format: str = "pcm",
     ) -> None:
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False),
@@ -179,6 +179,9 @@ class FishChunkedStream(tts.ChunkedStream):
         body: dict = {
             "text": clean_text,
             "format": self._opts.format,
+            "sample_rate": SAMPLE_RATE,
+            "latency": "balanced",
+            "chunk_length": 200,
         }
         if self._opts.reference_id:
             body["reference_id"] = self._opts.reference_id
