@@ -143,7 +143,7 @@ async def billing_loop(state: CallState, session: AgentSession, room: rtc.Room):
     """Periodically deduct voiceMinutes via the Next.js API."""
     await asyncio.sleep(BILLING_INTERVAL_SECONDS)
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         while True:
             try:
                 resp = await client.post(
