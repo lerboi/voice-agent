@@ -202,7 +202,7 @@ class FishChunkedStream(tts.ChunkedStream):
                         )
 
                     output_emitter.initialize(
-                        request_id=resp.headers.get("x-request-id", ""),
+                        request_id=resp.headers.get("x-request-id") or f"fish-{id(self)}-{attempt}",
                         sample_rate=SAMPLE_RATE,
                         num_channels=NUM_CHANNELS,
                         mime_type=f"audio/{self._opts.format}",
