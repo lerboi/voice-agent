@@ -446,6 +446,11 @@ async def entrypoint(ctx: agents.JobContext):
     @session.on("conversation_item_added")
     def on_conversation_item(event):
         item = event.item
+        # Skip non-ChatMessage items (AgentHandoff, FunctionCall,
+        # FunctionCallOutput, AgentConfigUpdate) — only ChatMessage has
+        # text_content and role; others would raise AttributeError.
+        if getattr(item, "type", None) != "message":
+            return
         content = item.text_content or ""
         if not content.strip():
             return
