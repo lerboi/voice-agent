@@ -12,20 +12,20 @@ import logging
 
 from openai import AsyncOpenAI
 
-from config import GROQ_API_KEY, GROQ_MODEL
+from config import DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL, DEEPINFRA_MODEL
 
 logger = logging.getLogger("anione-voice-agent")
 
 
-def _create_groq_client() -> AsyncOpenAI:
-    """Create a fresh AsyncOpenAI client for Groq.
+def _create_llm_client() -> AsyncOpenAI:
+    """Create a fresh AsyncOpenAI client for DeepInfra (OpenAI-compatible).
 
     Created per-call rather than module-level to ensure the httpx client
     binds to the current event loop (matches transcript_archiver.py pattern).
     """
     return AsyncOpenAI(
-        api_key=GROQ_API_KEY,
-        base_url="https://api.groq.com/openai/v1",
+        api_key=DEEPINFRA_API_KEY,
+        base_url=DEEPINFRA_BASE_URL,
     )
 
 SUMMARIZATION_PROMPT = """Condense the following conversation into a 200-word summary.
@@ -70,9 +70,9 @@ async def generate_shadow_summary(
     )
 
     try:
-        client = _create_groq_client()
+        client = _create_llm_client()
         response = await client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=DEEPINFRA_MODEL,
             messages=[
                 {"role": "system", "content": "You are a concise conversation summarizer."},
                 {"role": "user", "content": prompt},

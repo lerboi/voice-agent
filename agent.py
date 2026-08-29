@@ -3,7 +3,7 @@ Anione Voice Agent — LiveKit Agents SDK v1.0 entry point.
 
 Connects to LiveKit Cloud, auto-joins rooms created by createRoomAPI,
 and runs the real-time voice pipeline:
-  Deepgram STT -> Groq LLM (Llama 3.3 70B) -> Fish Speech TTS
+  Deepgram STT -> DeepInfra LLM (deepseek-ai/DeepSeek-V3) -> Fish Speech TTS
 
 Phases 3-6: character context, shadow summarization, post-call archival,
 token billing, XP tracking, relationship stage changes.
@@ -31,7 +31,7 @@ from config import (
     TURN_CHECKPOINT_INTERVAL,
     VOICE_AGENT_API_KEY,
 )
-from plugins.groq_llm import create_groq_llm
+from plugins.deepinfra_llm import create_deepinfra_llm
 from plugins.fish_tts import create_fish_tts, get_archetype_voice_id
 from services.context_loader import (
     load_character_context,
@@ -435,7 +435,7 @@ async def entrypoint(ctx: agents.JobContext):
     # Create AgentSession with pipeline components
     session = AgentSession(
         stt=deepgram.STT(language="multi"),
-        llm=create_groq_llm(),
+        llm=create_deepinfra_llm(),
         tts=create_fish_tts(voice_id=voice_id or None),
         vad=silero.VAD.load(),
         allow_interruptions=True,

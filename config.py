@@ -8,9 +8,13 @@ LIVEKIT_URL = os.environ["LIVEKIT_URL"]
 LIVEKIT_API_KEY = os.environ["LIVEKIT_API_KEY"]
 LIVEKIT_API_SECRET = os.environ["LIVEKIT_API_SECRET"]
 
-# Groq (OpenAI-compatible)
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+# DeepInfra (OpenAI-compatible) — replaces Groq as the voice LLM provider.
+# DeepSeek-V3 is a plain chat model (no hidden reasoning tokens), so NO
+# reasoning_effort is passed anywhere. Endpoint + model id per
+# https://deepinfra.com/deepseek-ai/DeepSeek-V3/api (163k context).
+DEEPINFRA_API_KEY = os.environ["DEEPINFRA_API_KEY"]
+DEEPINFRA_BASE_URL = os.getenv("DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai")
+DEEPINFRA_MODEL = os.getenv("DEEPINFRA_MODEL", "deepseek-ai/DeepSeek-V3")
 
 # Deepgram
 DEEPGRAM_API_KEY = os.environ["DEEPGRAM_API_KEY"]

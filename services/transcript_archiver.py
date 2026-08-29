@@ -22,8 +22,9 @@ from supabase import create_client
 import voyageai
 
 from config import (
-    GROQ_API_KEY,
-    GROQ_MODEL,
+    DEEPINFRA_API_KEY,
+    DEEPINFRA_BASE_URL,
+    DEEPINFRA_MODEL,
     SUPABASE_URL,
     SUPABASE_SERVICE_ROLE_KEY,
     VOYAGE_API_KEY,
@@ -37,15 +38,15 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY)
 
 
-def _create_groq_client() -> AsyncOpenAI:
-    """Create a fresh AsyncOpenAI client for Groq.
+def _create_llm_client() -> AsyncOpenAI:
+    """Create a fresh AsyncOpenAI client for DeepInfra (OpenAI-compatible).
 
     Created per-call rather than module-level to ensure the httpx client binds
     to the current event loop (archival runs after session.start() returns).
     """
     return AsyncOpenAI(
-        api_key=GROQ_API_KEY,
-        base_url="https://api.groq.com/openai/v1",
+        api_key=DEEPINFRA_API_KEY,
+        base_url=DEEPINFRA_BASE_URL,
     )
 
 
@@ -372,7 +373,7 @@ async def _generate_call_summary(
     duration_seconds: int,
     xp_gained: int,
 ) -> str | None:
-    """Generate a final call summary using Groq."""
+    """Generate a final call summary using DeepInfra (DeepSeek-V3)."""
     turns_text = "\n".join(
         f"{'User' if t.role == 'user' else character_name}: {t.content}"
         for t in transcript[-20:]  # last 20 turns for context if long call
@@ -393,9 +394,9 @@ Focus on: emotional beats, relationship developments, key facts learned, promise
 Output ONLY the summary paragraph."""
 
     try:
-        client = _create_groq_client()
+        client = _create_llm_client()
         response = await client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=DEEPINFRA_MODEL,
             messages=[
                 {"role": "system", "content": "You are a concise conversation summarizer."},
                 {"role": "user", "content": prompt},
@@ -446,9 +447,9 @@ OUTPUT (JSON only):
 {{"facts": [{{"key": "user_name", "value": "Jake", "sentence": "The user's name is Jake."}}]}}"""
 
     try:
-        client = _create_groq_client()
+        client = _create_llm_client()
         response = await client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=DEEPINFRA_MODEL,
             messages=[
                 {"role": "system", "content": "Extract user facts. Output ONLY valid JSON."},
                 {"role": "user", "content": prompt},
