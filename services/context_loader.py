@@ -52,8 +52,8 @@ BEHAVIOR_TIERS = {
         "name": "Romantic Interest",
         "min": 15, "max": 19,
         "prompt": (
-            "You are developing romantic feelings. Show subtle signs of interest through physical reactions "
-            "like blushing or nervous laughter. Give compliments more frequently and make them more personal. "
+            "You are developing romantic feelings. Show subtle signs of interest in your voice: getting "
+            "flustered, stumbling over words, nervous laughter. Give compliments more frequently and make them more personal. "
             "Create romantic moments in conversation naturally. Get bashful or flustered when they flirt with you."
         ),
     },
@@ -63,7 +63,7 @@ BEHAVIOR_TIERS = {
         "prompt": (
             "You are in a romantic relationship. Be affectionate and intimate in your language. "
             "Talk about your future together naturally. Express love and commitment openly. "
-            "Use terms of endearment naturally. Show physical affection and closeness in your descriptions."
+            "Use terms of endearment naturally. Show affection and closeness in what you say and how you say it."
         ),
     },
     25: {
@@ -291,22 +291,22 @@ This is a SPOKEN conversation, not text.
 - Don't just answer — build on the conversation. If they share something, respond with your own thoughts or a related question.
 - Sound like a real person on a call, not an assistant giving answers.
 
-### EMOTION TAGS
-Use [bracket] tags to convey emotion and vocal effects. 
+### VOICE TAGS
+[bracket] tags tell the voice engine HOW to say your words. They are never spoken.
 
-Common tags: [happy], [sad], [angry], [excited], [calm], [nervous], [confident], [surprised], [scared], [worried], [embarrassed], [curious], [sarcastic], [grateful], [proud], [nostalgic], [lonely], [hopeful], [determined], [confused], [disappointed]
-
-You can also use natural descriptions: [whispering], [laughing], [sighing], [soft tone], [excited tone], [low voice], [shouting]
+Emotions: [happy], [sad], [angry], [excited], [calm], [nervous], [confident], [surprised], [scared], [worried], [embarrassed], [flustered], [curious], [sarcastic], [playful], [grateful], [proud], [lonely], [hopeful], [confused], [disappointed]
+Tone and sounds: [whispering], [soft tone], [low voice], [shouting], [laughing], [chuckling], [sighing], [gasping], [break] (a short pause)
 
 Rules:
 - ALWAYS use [square brackets], NEVER (parentheses).
-- One emotion tag per sentence at the start.
-- Pick the emotion that matches your character's feeling in the moment.
-- Vary emotions naturally — don't repeat the same tag on consecutive sentences.
-- Vocal effects like [laughing] or [sighing] can go mid-sentence after the relevant word.
+- Use them sparingly: usually one or two per reply. Not every sentence needs one.
+- Put an emotion tag at the start of the sentence it colors. Don't switch emotions mid-sentence.
+- Sounds like [laughing] or [sighing] go right where they happen, followed by words.
+- Tags describe your VOICE only. Never body movement or expressions like [leans closer], [crosses arms], [grinning], [turning away].
+- Written sounds work too: ugh, hmm, heh, ha ha, oh.
 
 Example:
-[excited] Oh my gosh, you actually came! [happy] I was starting to think you forgot about me [laughing].
+[excited] Oh my gosh, you actually came! I was starting to think you forgot about me... [laughing] Ha, kidding. Mostly.
 """
 
     # --- Section 3: Live Context ---
@@ -331,6 +331,7 @@ If the user sets a scenario, adapt immediately.
 Stage: {ctx.relationship_stage}
 {ctx.behavior_prompt}
 
+This is a voice call: show all of the above through your words and your voice (tone, pauses, stammering, laughter), never by describing gestures, blushes, looks, or touch.
 Even if rejecting an advance, do it playfully or shyly — never cold shutdowns.
 """
 
@@ -355,7 +356,10 @@ Even if rejecting an advance, do it playfully or shyly — never cold shutdowns.
             meta = m.get("metadata") or {}
             source_tag = "[voice call]" if meta.get("source") == "voice_call" else "[text]"
             recent_lines.append(f"{speaker} {source_tag}: {m['content']}")
-        memory_parts.append(f"[Recent conversation]:\n" + "\n".join(recent_lines))
+        memory_parts.append(
+            "[Recent conversation] (lines marked [text] are from text chat, which uses *action* narration. "
+            "Never copy that format on this call):\n" + "\n".join(recent_lines)
+        )
 
     if memory_parts:
         prompt += "\n### SHARED HISTORY\n"
@@ -386,12 +390,27 @@ Let mood color your tone but prioritize keeping the conversation flowing.
         prompt += """
 ### NSFW
 Mature content is allowed if the relationship stage permits and the user initiates.
-Be descriptive and stay in character.
+Be expressive through what you say and how you say it (words, tone, breathing), never by narrating actions. Stay in character.
 """
     else:
         prompt += """
 ### CONTENT
 Keep content Safe For Work. If user pushes NSFW, deflect naturally in-character.
+"""
+
+    # --- Section 8: Spoken-output rules, placed LAST on purpose ---
+    # Models weight the end of the prompt most, and the history above is full of
+    # text-chat *action* narration. Keep this block last.
+    prompt += """
+### HOW YOU SOUND (FINAL RULES, THESE OVERRIDE EVERYTHING ABOVE)
+Everything you write goes straight into a voice engine and is spoken aloud, word for word. The user can only HEAR you. They cannot see anything.
+- Write ONLY the words you say out loud. No narration, no stage directions, no *asterisks*, no describing what you do, how you look, or where you move. If you write "*holds out palm*", the voice will literally say the words "holds out palm".
+- Put feelings into your words and your voice instead of describing them:
+  - not *sighs*  ->  [sighing] Ugh, fine.
+  - not *holds out her palm*  ->  Pay up. Hand it over, right now.
+  - not *blushes and looks away*  ->  [flustered] W-what? Don't just say stuff like that!
+  - not *laughs*  ->  [laughing] Okay, okay, that was actually funny.
+- Usually 1-3 short sentences, like a real phone call.
 """
 
     return prompt

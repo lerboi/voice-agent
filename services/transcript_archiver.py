@@ -22,11 +22,12 @@ from supabase import create_client
 import voyageai
 
 from config import (
-    OPENROUTER_API_KEY,
-    OPENROUTER_BASE_URL,
-    OPENROUTER_MODEL,
-    OPENROUTER_HEADERS,
-    OPENROUTER_PROVIDER_PREFS,
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_EXTRA_BODY,
+    LLM_HEADERS,
+    LLM_JSON_EXTRA_BODY,
+    LLM_MODEL,
     SUPABASE_URL,
     SUPABASE_SERVICE_ROLE_KEY,
     VOYAGE_API_KEY,
@@ -41,15 +42,15 @@ voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY)
 
 
 def _create_llm_client() -> AsyncOpenAI:
-    """Create a fresh AsyncOpenAI client for OpenRouter (OpenAI-compatible).
+    """Create a fresh AsyncOpenAI client for the voice LLM provider (OpenAI-compatible).
 
     Created per-call rather than module-level to ensure the httpx client binds
     to the current event loop (archival runs after session.start() returns).
     """
     return AsyncOpenAI(
-        api_key=OPENROUTER_API_KEY,
-        base_url=OPENROUTER_BASE_URL,
-        default_headers=OPENROUTER_HEADERS,
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        default_headers=LLM_HEADERS or None,
     )
 
 
@@ -376,7 +377,7 @@ async def _generate_call_summary(
     duration_seconds: int,
     xp_gained: int,
 ) -> str | None:
-    """Generate a final call summary using OpenRouter (DeepSeek-V3)."""
+    """Generate a final call summary using the voice LLM provider (config.py)."""
     turns_text = "\n".join(
         f"{'User' if t.role == 'user' else character_name}: {t.content}"
         for t in transcript[-20:]  # last 20 turns for context if long call
@@ -399,14 +400,14 @@ Output ONLY the summary paragraph."""
     try:
         client = _create_llm_client()
         response = await client.chat.completions.create(
-            model=OPENROUTER_MODEL,
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": "You are a concise conversation summarizer."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
             max_tokens=300,
-            extra_body={"provider": OPENROUTER_PROVIDER_PREFS},
+            extra_body=LLM_EXTRA_BODY,
         )
         return response.choices[0].message.content.strip()
     except Exception:
@@ -453,7 +454,7 @@ OUTPUT (JSON only):
     try:
         client = _create_llm_client()
         response = await client.chat.completions.create(
-            model=OPENROUTER_MODEL,
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": "Extract user facts. Output ONLY valid JSON."},
                 {"role": "user", "content": prompt},
@@ -461,10 +462,10 @@ OUTPUT (JSON only):
             temperature=0.1,
             max_tokens=500,
             response_format={"type": "json_object"},
-            # Pinned upstream order + only providers that honour every request
-            # param (require_parameters) so JSON mode is guaranteed — this
-            # automatically skips upstreams without response_format support.
-            extra_body={"provider": {**OPENROUTER_PROVIDER_PREFS, "require_parameters": True}},
+            # Provider settings + thinking off; on OpenRouter this also requires
+            # upstreams that honour every param (require_parameters) so JSON mode
+            # is guaranteed.
+            extra_body=LLM_JSON_EXTRA_BODY,
         )
 
         import json

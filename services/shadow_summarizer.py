@@ -13,26 +13,26 @@ import logging
 from openai import AsyncOpenAI
 
 from config import (
-    OPENROUTER_API_KEY,
-    OPENROUTER_BASE_URL,
-    OPENROUTER_MODEL,
-    OPENROUTER_HEADERS,
-    OPENROUTER_PROVIDER_PREFS,
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_EXTRA_BODY,
+    LLM_HEADERS,
+    LLM_MODEL,
 )
 
 logger = logging.getLogger("anione-voice-agent")
 
 
 def _create_llm_client() -> AsyncOpenAI:
-    """Create a fresh AsyncOpenAI client for OpenRouter (OpenAI-compatible).
+    """Create a fresh AsyncOpenAI client for the voice LLM provider (OpenAI-compatible).
 
     Created per-call rather than module-level to ensure the httpx client
     binds to the current event loop (matches transcript_archiver.py pattern).
     """
     return AsyncOpenAI(
-        api_key=OPENROUTER_API_KEY,
-        base_url=OPENROUTER_BASE_URL,
-        default_headers=OPENROUTER_HEADERS,
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        default_headers=LLM_HEADERS or None,
     )
 
 SUMMARIZATION_PROMPT = """Condense the following conversation into a 200-word summary.
@@ -79,15 +79,15 @@ async def generate_shadow_summary(
     try:
         client = _create_llm_client()
         response = await client.chat.completions.create(
-            model=OPENROUTER_MODEL,
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": "You are a concise conversation summarizer."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
             max_tokens=400,
-            # Same pinned upstream order as the voice LLM (bf16 first)
-            extra_body={"provider": OPENROUTER_PROVIDER_PREFS},
+            # Same provider settings + thinking off as the voice LLM
+            extra_body=LLM_EXTRA_BODY,
         )
 
         summary = response.choices[0].message.content.strip()

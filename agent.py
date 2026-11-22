@@ -31,7 +31,7 @@ from config import (
     TURN_CHECKPOINT_INTERVAL,
     VOICE_AGENT_API_KEY,
 )
-from plugins.openrouter_llm import create_openrouter_llm
+from plugins.voice_llm import create_voice_llm
 from plugins.fish_tts import create_fish_tts, get_archetype_voice_id
 from services.context_loader import (
     load_character_context,
@@ -435,7 +435,7 @@ async def entrypoint(ctx: agents.JobContext):
     # Create AgentSession with pipeline components
     session = AgentSession(
         stt=deepgram.STT(language="multi"),
-        llm=create_openrouter_llm(),
+        llm=create_voice_llm(),
         tts=create_fish_tts(voice_id=voice_id or None),
         vad=silero.VAD.load(),
         allow_interruptions=True,
@@ -601,7 +601,7 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Character speaks first with a contextual greeting
     session.generate_reply(
-        instructions="Greet the user with a short, warm, in-character greeting (1 sentence). React to your current mood and relationship stage naturally.",
+        instructions="Greet the user with a short, warm, in-character greeting (1 sentence). React to your current mood and relationship stage naturally. Spoken words only, no narration or *actions*.",
     )
 
     # Archival is handled by the client-triggered archiveCallAPI endpoint.
